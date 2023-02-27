@@ -1,0 +1,587 @@
+package file
+
+import (
+	"gitee.com/sy_183/common/errors"
+	"gitee.com/sy_183/common/lifecycle"
+	"gitee.com/sy_183/common/utils"
+	"os"
+	"sync"
+	"time"
+)
+
+// Context 文件上下文
+type Context struct {
+	// 文件路径
+	file string
+	// 文件指针
+	fp *os.File
+	// 当前的文件信息
+	info os.FileInfo
+	// 当前的文件指针偏移
+	offset int64
+	// 当前的文件大小
+	size int64
+
+	// 打开文件时是否以追加方式打开的
+	append bool
+	// 打开文件时是否截断了文件
+	truncate bool
+	// 是否使用了直接IO写入文件
+	direct bool
+	// 是否使用了同步方式写入文件
+	sync bool
+
+	// 文件生命周期携带的上下文数据
+	context any
+
+	mu sync.Mutex
+}
+
+func (c *Context) File() string {
+	return c.file
+}
+
+func (c *Context) Fp() *os.File {
+	return c.fp
+}
+
+func (c *Context) Append() bool {
+	return c.append
+}
+
+func (c *Context) Truncate() bool {
+	return c.truncate
+}
+
+func (c *Context) Direct() bool {
+	return c.direct
+}
+
+func (c *Context) Sync() bool {
+	return c.sync
+}
+
+func (c *Context) FileContext() any {
+	return c.context
+}
+
+func (c *Context) lock() {
+	c.mu.Lock()
+}
+
+func (c *Context) unLock() {
+	c.mu.Unlock()
+}
+
+type closeContext struct {
+	*Context
+	req *UpdateRequest
+}
+
+type Manager struct {
+	lifecycle.Lifecycle
+	context     *Context
+	contextLock sync.Mutex
+
+	updateSignal chan *UpdateRequest
+	writeSignal  chan *WriteRequest
+	deleteSignal chan *DeleteRequest
+	closeSignal  chan closeContext
+}
+
+func NewManager(maxUpdating, maxWriting, maxDeleting, maxClosing int) *Manager {
+	if maxUpdating < 1 {
+		maxUpdating = 1
+	}
+	if maxWriting < 1 {
+		maxWriting = 1
+	}
+	if maxDeleting < 1 {
+		maxDeleting = 1
+	}
+	if maxClosing < 1 {
+		maxClosing = 16
+	}
+	m := &Manager{
+		updateSignal: make(chan *UpdateRequest, maxUpdating-1),
+		writeSignal:  make(chan *WriteRequest, maxWriting-1),
+		deleteSignal: make(chan *DeleteRequest, maxDeleting-1),
+		closeSignal:  make(chan closeContext, maxClosing-1),
+	}
+	_, m.Lifecycle = lifecycle.New("", lifecycle.Context(m.run))
+	return m
+}
+
+func (m *Manager) loadAndLockContext() *Context {
+	m.contextLock.Lock()
+	defer m.contextLock.Unlock()
+	ctx := m.context
+	if ctx != nil {
+		ctx.mu.Lock()
+	}
+	return ctx
+}
+
+func (m *Manager) doClose(ctx closeContext) *ClosedResponse {
+	ctx.lock()
+	defer ctx.unLock()
+	start := time.Now()
+	res := &ClosedResponse{FileSize: ctx.size, Request: ctx.req}
+	if err := ctx.fp.Close(); err != nil {
+		res.Err = &CloseError{Err{err}}
+	}
+	// 计算关闭文件花费的时间
+	res.Elapse = time.Since(start)
+	start = start.Add(res.Elapse)
+	return res
+}
+
+func (m *Manager) close(ctx closeContext, notRetry bool, interrupter chan struct{}) error {
+	req := ctx.req
+	if req.CloseRetry.MaxRetry == 0 || notRetry {
+		req.ClosedFuture.Response(m.doClose(ctx))
+	} else {
+		var res *ClosedResponse
+		err := lifecycle.MakeRetry(lifecycle.Retry{
+			Do: func() error {
+				res = m.doClose(ctx)
+				if res.Err != nil {
+					return res.Err
+				}
+				return nil
+			},
+			MaxRetry:    req.CloseRetry.MaxRetry,
+			Interval:    req.CloseRetry.Interval,
+			Interrupter: interrupter,
+		}).Todo()
+		req.ClosedFuture.Response(res)
+		if err == lifecycle.InterruptError {
+			return lifecycle.InterruptError
+		}
+	}
+	return nil
+}
+
+func (m *Manager) closerRun(interrupter chan struct{}) error {
+	defer func() {
+		for {
+			select {
+			case ctx := <-m.closeSignal:
+				m.close(ctx, false, nil)
+			default:
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case ctx := <-m.closeSignal:
+			if err := m.close(ctx, true, interrupter); err != nil {
+				return nil
+			}
+		case <-interrupter:
+			return nil
+		}
+	}
+}
+
+func (m *Manager) doOpen(req *UpdateRequest) *OpenedResponse {
+	res := &OpenedResponse{Request: req}
+	if req.File == "" {
+		// 不打开新文件，只关闭旧文件
+		return res
+	}
+
+	start := time.Now()
+
+	// 打开文件
+	flag := os.O_CREATE | os.O_WRONLY
+	if req.Append {
+		flag |= os.O_APPEND
+	}
+	if req.Truncate {
+		flag |= os.O_TRUNC
+	}
+	if req.Sync {
+		flag |= os.O_SYNC
+	}
+	fp, err := os.OpenFile(req.File, flag, 0644)
+	// 计算打开文件花费的时间
+	res.OpenElapse = time.Since(start)
+	start = start.Add(res.OpenElapse)
+	if err != nil {
+		res.Err = &OpenError{Err{err}}
+		return res
+	}
+
+	// 获取文件信息
+	info, err := fp.Stat()
+	// 计算获取文件信息花费的时间
+	res.GetInfoElapse = time.Since(start)
+	start = start.Add(res.GetInfoElapse)
+	if err != nil {
+		res.Err = &GetInfoError{Err{err}}
+		// 获取不到文件信息，关闭文件
+		if err := fp.Close(); err != nil {
+			res.Err = errors.Append(res.Err, &CloseError{Err{err}})
+		}
+		// 计算关闭文件花费的时间
+		res.CloseElapse = time.Since(start)
+		start = start.Add(res.CloseElapse)
+		return res
+	}
+
+	// 获取当前文件指针偏移
+	var offset int64
+	if !req.Append {
+		off, err := fp.Seek(0, 1)
+		// 计算获取文件指针位置花费的时间
+		res.SeekElapse = time.Since(start)
+		start = start.Add(res.SeekElapse)
+		if err != nil {
+			res.Err = &SeekError{Err{err}}
+			if err := fp.Close(); err != nil {
+				res.Err = errors.Append(res.Err, &CloseError{Err{err}})
+			}
+			// 计算关闭文件花费的时间
+			res.CloseElapse = time.Since(start)
+			start = start.Add(res.CloseElapse)
+			return res
+		}
+		offset = off
+	} else {
+		// 以追加方式打开文件，无法调用 Seek 函数确定文件指针位置，使用文件大小作为当前文件指针偏移配置
+		offset = info.Size()
+	}
+
+	res.Context = &Context{
+		file:   req.File,
+		fp:     fp,
+		info:   info,
+		offset: offset,
+		size:   info.Size(),
+
+		append:   req.Append,
+		truncate: req.Truncate,
+		direct:   req.Direct,
+		sync:     req.Sync,
+
+		context: req.FileContext,
+	}
+
+	res.FileInfo = info
+	res.Offset = offset
+	return res
+}
+
+func (m *Manager) openCompletion(req *UpdateRequest, res *OpenedResponse) {
+	m.contextLock.Lock()
+	old := m.context
+	m.context = res.Context
+	m.contextLock.Unlock()
+	req.Future.Response(res)
+	if old != nil {
+		m.closeSignal <- closeContext{Context: old, req: req}
+	} else {
+		req.ClosedFuture.Response(&ClosedResponse{Request: req})
+	}
+}
+
+func (m *Manager) open(req *UpdateRequest, notRetry bool, interrupter chan struct{}) error {
+	if req.Retry.MaxRetry == 0 || notRetry {
+		m.openCompletion(req, m.doOpen(req))
+	} else {
+		var res *OpenedResponse
+		err := lifecycle.MakeRetry(lifecycle.Retry{
+			Do: func() error {
+				res = m.doOpen(req)
+				if res.Err != nil {
+					return res.Err
+				}
+				return nil
+			},
+			MaxRetry:    req.Retry.MaxRetry,
+			Interval:    req.Retry.Interval,
+			Interrupter: interrupter,
+		}).Todo()
+		m.openCompletion(req, res)
+		if err == lifecycle.InterruptError {
+			return lifecycle.InterruptError
+		}
+	}
+	return nil
+}
+
+func (m *Manager) updaterRun(interrupter chan struct{}) error {
+	defer func() {
+		for {
+			select {
+			case req := <-m.updateSignal:
+				m.open(req, true, nil)
+			default:
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case req := <-m.updateSignal:
+			if err := m.open(req, false, interrupter); err == lifecycle.InterruptError {
+				return nil
+			}
+		case <-interrupter:
+			return nil
+		}
+	}
+}
+
+func (m *Manager) doWrite(req *WriteRequest, data []byte) *WriteResponse {
+	res := &WriteResponse{Request: req}
+	ctx := m.loadAndLockContext()
+	if ctx == nil {
+		res.Err = &OperationError{Operation: "writer file context not set"}
+		return res
+	}
+	defer ctx.unLock()
+
+	res.FileInfo = ctx.info
+	res.Size = ctx.size
+	res.Offset = ctx.offset
+
+	start := time.Now()
+
+	// 如果指定了偏移写并且文件不是以追加方式打开，则先使用 Seek 函数移动函数指针
+	if seek := req.Seek; seek != nil && !ctx.append {
+		offset, err := ctx.fp.Seek(seek.Offset, seek.Whence)
+		// 计算修改文件指针位置花费的时间
+		res.SeekElapse = time.Since(start)
+		start = start.Add(res.SeekElapse)
+		if err != nil {
+			res.Err = &SeekError{Err{err}}
+			return res
+		}
+		ctx.offset = offset
+	}
+
+	// 将数据写入文件，并计算新的文件指针偏移和文件大小
+	n, err := ctx.fp.Write(data)
+	// 计算文件写入花费的时间
+	res.WriteElapse = time.Since(start)
+	start = start.Add(res.WriteElapse)
+	if n > 0 {
+		ctx.offset += int64(n)
+		if ctx.offset > ctx.size {
+			ctx.size = ctx.offset
+		}
+		res.Size = int64(n)
+		res.Offset = ctx.offset
+	}
+	if err != nil {
+		res.Err = &WriteError{Err{err}}
+		return res
+	}
+
+	// 如果指定了写入后重新获取文件信息，则更新文件信息
+	if req.GetInfo {
+		info, err := ctx.fp.Stat()
+		// 计算更新文件信息花费的时间
+		res.GetInfoElapse = time.Since(start)
+		start = start.Add(res.GetInfoElapse)
+		if err != nil {
+			res.Err = &GetInfoError{Err{err}}
+			return res
+		}
+		ctx.info = info
+		res.FileInfo = info
+	}
+	return res
+}
+
+func (m *Manager) write(req *WriteRequest, notRetry bool, interrupter chan struct{}) error {
+	if req.Retry.MaxRetry == 0 || notRetry {
+		req.Future.Response(m.doWrite(req, req.Data))
+	} else {
+		data := req.Data
+		response := &WriteResponse{}
+		err := lifecycle.MakeRetry(lifecycle.Retry{
+			Do: func() error {
+				res := m.doWrite(req, data)
+				data = data[res.Size:]
+				res.Size = response.Size + res.Size
+				response = res
+				if res.Err != nil {
+					return res.Err
+				}
+				return nil
+			},
+			MaxRetry:    req.Retry.MaxRetry,
+			Interval:    req.Retry.Interval,
+			Interrupter: interrupter,
+		}).Todo()
+		req.Future.Response(response)
+		if err == lifecycle.InterruptError {
+			return lifecycle.InterruptError
+		}
+	}
+	return nil
+}
+
+func (m *Manager) writerRun(interrupter chan struct{}) error {
+	defer func() {
+		for {
+			select {
+			case req := <-m.writeSignal:
+				m.write(req, true, nil)
+			default:
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case req := <-m.writeSignal:
+			if err := m.write(req, false, interrupter); err == lifecycle.InterruptError {
+				return nil
+			}
+		case <-interrupter:
+			return nil
+		}
+	}
+}
+
+func (m *Manager) doDelete(req *DeleteRequest) *DeleteResponse {
+	res := &DeleteResponse{Request: req}
+	if err := os.Remove(req.File); err != nil {
+		res.Err = &RemoveError{Err{err}}
+	}
+	return res
+}
+
+func (m *Manager) deleterRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case req := <-m.deleteSignal:
+			if req.Retry.MaxRetry == 0 {
+				req.Future.Response(m.doDelete(req))
+			} else {
+				var res *DeleteResponse
+				err := lifecycle.MakeRetry(lifecycle.Retry{
+					Do: func() error {
+						res = m.doDelete(req)
+						if res.Err != nil {
+							return res.Err
+						}
+						return nil
+					},
+					MaxRetry:    req.Retry.MaxRetry,
+					Interval:    req.Retry.Interval,
+					Interrupter: interrupter,
+				}).Todo()
+				req.Future.Response(res)
+				if err == lifecycle.InterruptError {
+					return nil
+				}
+			}
+		case <-interrupter:
+			return nil
+		}
+	}
+}
+
+func (m *Manager) run(interrupter chan struct{}) error {
+	_, closer := lifecycle.NewOnce("closer", lifecycle.Context(m.closerRun))
+	_, updater := lifecycle.NewOnce("updater", lifecycle.Context(m.updaterRun))
+	_, writer := lifecycle.NewOnce("writer", lifecycle.Context(m.writerRun))
+	_, deleter := lifecycle.NewOnce("deleter", lifecycle.Context(m.deleterRun))
+
+	<-interrupter
+	deleter.Close(nil)
+	writer.Close(nil)
+
+	updater.CloseWait()
+	closer.CloseWait()
+
+	deleter.Wait()
+	writer.Wait()
+
+	if old := m.context; old != nil {
+		m.context = nil
+		if err := old.fp.Close(); err != nil {
+			return &CloseError{Err{err}}
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) Update(req *UpdateRequest, try, async bool) *UpdateRequest {
+	if try {
+		if utils.ChanTryPush(m.updateSignal, req) {
+			return req
+		}
+		return nil
+	}
+	if async {
+		utils.ChanAsyncPush(m.updateSignal, req)
+	} else {
+		m.updateSignal <- req
+	}
+	return req
+}
+
+func (m *Manager) UpdateSync(req *UpdateRequest) *OpenedResponse {
+	och := req.Future.Channel
+	req.Future.Channel = make(chan *OpenedResponse)
+	m.Update(req, false, false)
+	res := <-req.Future.Channel
+	req.Future.Channel = och
+	return res
+}
+
+func (m *Manager) Write(req *WriteRequest, try, async bool) *WriteRequest {
+	if try {
+		if utils.ChanTryPush(m.writeSignal, req) {
+			return req
+		}
+		return nil
+	}
+	if async {
+		utils.ChanAsyncPush(m.writeSignal, req)
+	} else {
+		m.writeSignal <- req
+	}
+	return req
+}
+
+func (m *Manager) WriteSync(req *WriteRequest) *WriteResponse {
+	och := req.Future.Channel
+	req.Future.Channel = make(chan *WriteResponse)
+	m.Write(req, false, false)
+	res := <-req.Future.Channel
+	req.Future.Channel = och
+	return res
+}
+
+func (m *Manager) Delete(req *DeleteRequest, try, async bool) *DeleteRequest {
+	if try {
+		if utils.ChanTryPush(m.deleteSignal, req) {
+			return req
+		}
+		return nil
+	}
+	if async {
+		utils.ChanAsyncPush(m.deleteSignal, req)
+	} else {
+		m.deleteSignal <- req
+	}
+	return req
+}
+
+func (m *Manager) DeleteSync(req *DeleteRequest) *DeleteResponse {
+	och := req.Future.Channel
+	req.Future.Channel = make(chan *DeleteResponse)
+	m.Delete(req, false, false)
+	res := <-req.Future.Channel
+	req.Future.Channel = och
+	return res
+}

@@ -1,0 +1,1597 @@
+package file
+
+import (
+	"fmt"
+	"gitee.com/sy_183/common/container"
+	"gitee.com/sy_183/common/def"
+	"gitee.com/sy_183/common/errors"
+	"gitee.com/sy_183/common/lifecycle"
+	"gitee.com/sy_183/common/log"
+	"gitee.com/sy_183/common/utils"
+	dbPkg "gitee.com/sy_183/cvds-mas/db"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"math"
+	"path"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type fileInfoCreateContext struct {
+	*File
+	futures []chan error
+	created atomic.Bool
+	err     error
+	mu      sync.Mutex
+}
+
+func newFileInfoCreateContext(file *File, created bool) *fileInfoCreateContext {
+	ctx := &fileInfoCreateContext{File: file}
+	ctx.created.Store(created)
+	return ctx
+}
+
+func (c *fileInfoCreateContext) Created() bool {
+	return c.created.Load()
+}
+
+func (c *fileInfoCreateContext) notifyCreated(err error) {
+	c.mu.Lock()
+	c.err = err
+	for _, future := range c.futures {
+		utils.ChanAsyncPush(future, err)
+	}
+	c.futures = c.futures[:0]
+	c.mu.Unlock()
+	c.created.Store(true)
+}
+
+func (c *fileInfoCreateContext) CreatedFuture(future chan error) chan error {
+	future = def.MakeChan(future, 1)
+	if c.created.Load() {
+		utils.ChanAsyncPush(future, c.err)
+		return future
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.futures = append(c.futures, future)
+	return future
+}
+
+type fileInfoUpdateContext struct {
+	*fileInfoCreateContext
+	fields []string
+}
+
+type fileInfoDeleteContext struct {
+	*fileInfoCreateContext
+}
+
+// dbMetaManager 使用数据库存储的文件存储元数据管理器，用于对视频索引信息、文件信息的数据库增删改查以及缓存的管理
+type dbMetaManager struct {
+	lifecycle.Lifecycle
+	runner *lifecycle.DefaultRunner
+
+	// 通道
+	channel *Channel
+
+	// 数据库句柄
+	db *gorm.DB
+	// 数据库连接地址
+	dbDsn string
+
+	// 通道信息缓存
+	channelInfo *ChannelInfo
+	// 通知更新数据库中通道信息的通道
+	channelUpdateSignal chan struct{}
+	// 通道信息缓存锁
+	channelLock sync.Mutex
+
+	// 最新索引缓存最大容量
+	lastIndexMaxCache uint
+	// 最早索引缓存最大容量
+	firstIndexMaxCache uint
+	// 已刷新到数据库中的最新索引缓存，可用于快速的查询索引或扩充最早索引缓存
+	lastIndexCache *container.LinkedMap[uint64, *Index]
+	// 最早索引缓存，可用于快速的查询索引或判断是否有索引需要删除
+	firstIndexCache *container.LinkedMap[uint64, *Index]
+	// 未刷新到数据库中的最新索引缓存
+	needRefreshedIndex *container.LinkedMap[uint64, *Index]
+
+	// 最早的索引缓存，可用于快速的查询索引或判断是否有索引需要删除
+	earliestIndexCache *IndexCache
+	// 最新的索引缓存，可用于快速的查询索引或扩充最早的索引缓存
+	latestIndexCache *IndexCache
+	// 未刷新到数据库中的索引数量
+	needRefreshed int
+	// 通知加载或扩充最早索引缓存的通道
+	firstIndexLoadSignal chan struct{}
+	// 通知向数据库中添加索引的通道
+	indexCreateSignal chan struct{}
+	// 索引缓存锁
+	indexLock sync.Mutex
+
+	// needDeletedIndex 的自增ID，没有实际意义
+	indexDeleteId uint64
+	// 通知从数据库中删除索引的通道
+	indexDeleteSignal chan struct{}
+	// 需要删除的索引
+	needDeletedIndex *container.LinkedMap[uint64, *Index]
+	// 需要删除的索引的锁
+	indexDeleteLock sync.Mutex
+
+	// 通知向数据库中添加文件信息的通道
+	fileCreateSignal chan struct{}
+	// 已刷新到数据库中的文件信息缓存
+	files *container.LinkedMap[uint64, *File]
+	// 未刷新到数据库中的文件信息缓存
+	needRefreshedFiles *container.LinkedMap[uint64, *fileInfoCreateContext]
+	// 文件缓存锁
+	filesLock sync.Mutex
+
+	// needUpdatedFiles 的自增ID，没有实际意义
+	fileUpdateId uint64
+	// 通知更新数据库中文件信息的通道
+	fileUpdateSignal chan struct{}
+	// 需要更新的文件
+	needUpdatedFiles *container.LinkedMap[uint64, fileInfoUpdateContext]
+	// 需要更新的文件的锁
+	fileUpdateLock sync.Mutex
+
+	// needDeletedFiles 的自增ID，没有实际意义
+	fileDeleteId uint64
+	// 通知从数据库中删除文件信息的通道
+	fileDeleteSignal chan struct{}
+	// 需要删除的文件
+	needDeletedFiles *container.LinkedMap[uint64, fileInfoDeleteContext]
+	// 需要删除的文件的锁
+	fileDeleteLock sync.Mutex
+
+	log.AtomicLogger
+}
+
+func newDBMetaManager(channel *Channel, db *gorm.DB, dsn string) *dbMetaManager {
+	channelName := channel.Name()
+	m := &dbMetaManager{
+		channel: channel,
+		db:      db,
+		dbDsn:   dsn,
+
+		channelUpdateSignal: make(chan struct{}, 1),
+
+		lastIndexMaxCache:    DefaultLastIndexMaxCache,
+		firstIndexMaxCache:   DefaultFirstIndexMaxCache,
+		lastIndexCache:       container.NewLinkedMap[uint64, *Index](0),
+		firstIndexCache:      container.NewLinkedMap[uint64, *Index](0),
+		firstIndexLoadSignal: make(chan struct{}),
+
+		indexCreateSignal:  make(chan struct{}, 1),
+		needRefreshedIndex: container.NewLinkedMap[uint64, *Index](0),
+
+		indexDeleteSignal: make(chan struct{}, 1),
+		needDeletedIndex:  container.NewLinkedMap[uint64, *Index](0),
+
+		fileCreateSignal:   make(chan struct{}, 1),
+		files:              container.NewLinkedMap[uint64, *File](0),
+		needRefreshedFiles: container.NewLinkedMap[uint64, *fileInfoCreateContext](0),
+
+		fileUpdateSignal: make(chan struct{}, 1),
+		needUpdatedFiles: container.NewLinkedMap[uint64, fileInfoUpdateContext](0),
+
+		fileDeleteSignal: make(chan struct{}, 1),
+		needDeletedFiles: container.NewLinkedMap[uint64, fileInfoDeleteContext](0),
+	}
+	if m.dbDsn == "" {
+		m.dbDsn = "cvds:cvds2020@tcp(127.0.0.1:3306)/cvdsrec"
+	}
+	m.runner, m.Lifecycle = lifecycle.New(fmt.Sprintf("file storage database metadata manager(%s)", channelName),
+		lifecycle.Context(m.run),
+	)
+	m.runner.AddCustomState("index loaded")
+	return m
+}
+
+func (*dbMetaManager) tableName(name string) func(tx *gorm.DB) *gorm.DB {
+	return func(tx *gorm.DB) *gorm.DB {
+		return tx.Table(name)
+	}
+}
+
+func (m *dbMetaManager) channelInfoTable() *gorm.DB {
+	return m.db.Scopes(m.tableName("channel"))
+}
+
+func (m *dbMetaManager) indexTable() *gorm.DB {
+	return m.db.Scopes(m.tableName("index_" + m.channel.Name()))
+}
+
+func (m *dbMetaManager) fileTable() *gorm.DB {
+	return m.db.Scopes(m.tableName("file_" + m.channel.Name()))
+}
+
+func (m *dbMetaManager) AddIndexLoadedFuture(future chan bool) chan bool {
+	return m.AddCustomStateFuture("index loaded", future)
+}
+
+// openDB 打开数据库
+func (m *dbMetaManager) openDB(interrupter chan struct{}) bool {
+	if m.db != nil {
+		return true
+	}
+	if err := lifecycle.MakeRetry(lifecycle.Retry{
+		Do: func() error {
+			db, err := gorm.Open(mysql.Open(m.dbDsn), &gorm.Config{
+				Logger: dbPkg.WrapGormLogger(m.Logger(), true, time.Millisecond*200),
+			})
+			if err != nil {
+				return err
+			}
+			m.db = db
+			return nil
+		},
+		MaxRetry:    -1,
+		Interrupter: interrupter,
+	}).Todo(); err == lifecycle.InterruptError {
+		return false
+	}
+	if _, interrupted := utils.ChanTryPop(interrupter); interrupted {
+		return false
+	}
+	return true
+}
+
+// loadChannelInfo 在初始化时加载通道信息，如果没有通道信息则创建
+func (m *dbMetaManager) loadChannelInfo(interrupter chan struct{}) bool {
+	var channelNeedCreate bool
+	if err := lifecycle.MakeRetry(lifecycle.Retry{
+		Do: func() error {
+			channelInfo := &ChannelInfo{}
+		createChannel:
+			// channel info not found, create it
+			if channelNeedCreate {
+				channelInfo.Name = m.channel.Name()
+				channelInfo.Location = curLocationName()
+				channelInfo.LocationOffset = curLocationOffset()
+				if res := m.channelInfoTable().Create(channelInfo); res.Error != nil {
+					m.Logger().ErrorWith("create channel info error", res.Error)
+					return res.Error
+				}
+				m.Logger().Info("create channel info success", log.Object("channel info", channelInfo))
+				m.channelInfo = channelInfo
+				return nil
+			}
+			// query channel info from database
+			if res := m.channelInfoTable().Where("name = ?", m.channel.Name()).First(channelInfo); res.Error != nil {
+				if errors.Is(res.Error, gorm.ErrRecordNotFound) {
+					m.Logger().Info("channel info not found, create it")
+					channelNeedCreate = true
+					goto createChannel
+				}
+				m.Logger().ErrorWith("get channel info error", res.Error)
+				return res.Error
+			}
+			m.Logger().Info("get channel info success", log.Object("channel info", channelInfo))
+			m.channelInfo = channelInfo
+			return nil
+		},
+		MaxRetry:    -1,
+		Interrupter: interrupter,
+	}).Todo(); err == lifecycle.InterruptError {
+		return false
+	}
+	if _, interrupted := utils.ChanTryPop(interrupter); interrupted {
+		return false
+	}
+	return true
+}
+
+// ensureIndexTable 在初始化时如果没有索引信息表则创建
+func (m *dbMetaManager) ensureIndexTable(interrupter chan struct{}) bool {
+	if err := lifecycle.MakeRetry(lifecycle.Retry{
+		Do: func() error {
+			table := "index_" + m.channel.Name()
+			if !m.indexTable().Migrator().HasTable(table) {
+				comment := fmt.Sprintf("COMMENT = '通道(%s)索引表'", m.channel.Name())
+				m.Logger().Info("file index table not found, create it")
+				if err := m.indexTable().Set("gorm:table_options", comment).Migrator().CreateTable(&Index{}); err != nil {
+					m.Logger().ErrorWith("create file index table error", err, log.String("table", table))
+					return err
+				}
+				m.Logger().Info("create file index table success")
+			}
+			return nil
+		},
+		MaxRetry:    -1,
+		Interrupter: interrupter,
+	}).Todo(); err == lifecycle.InterruptError {
+		return false
+	}
+	if _, interrupted := utils.ChanTryPop(interrupter); interrupted {
+		return false
+	}
+	return true
+}
+
+// ensureFileTable 在初始化时如果没有文件信息表则创建
+func (m *dbMetaManager) ensureFileTable(interrupter chan struct{}) bool {
+	if err := lifecycle.MakeRetry(lifecycle.Retry{
+		Do: func() error {
+			table := "file_" + m.channel.Name()
+			if !m.fileTable().Migrator().HasTable(table) {
+				m.Logger().Info("file info table not found, create it")
+				comment := fmt.Sprintf("COMMENT = '通道(%s)文件表'", m.channel.Name())
+				if err := m.fileTable().Set("gorm:table_options", comment).Migrator().CreateTable(&File{}); err != nil {
+					m.Logger().ErrorWith("create file info table error", err, log.String("table", table))
+					return err
+				}
+				m.Logger().Info("create file info table success")
+			}
+			return nil
+		},
+		MaxRetry:    -1,
+		Interrupter: interrupter,
+	}).Todo(); err == lifecycle.InterruptError {
+		return false
+	}
+	if _, interrupted := utils.ChanTryPop(interrupter); interrupted {
+		return false
+	}
+	return true
+}
+
+// listFile 在初始化时从数据库中加载所有的文件信息
+func (m *dbMetaManager) listFile(interrupter chan struct{}) bool {
+	if err := lifecycle.MakeRetry(lifecycle.Retry{
+		Do: func() error {
+			var files []*File
+			if res := m.fileTable().Find(&files); res.Error != nil {
+				m.Logger().ErrorWith("list file info error", res.Error)
+				return res.Error
+			}
+			m.Logger().Info("list file info success", log.Int("file count", len(files)))
+			m.filesLock.Lock()
+			for _, file := range files {
+				m.files.Put(file.Seq, file)
+			}
+			m.filesLock.Unlock()
+			return nil
+		},
+		MaxRetry:    -1,
+		Interrupter: interrupter,
+	}).Todo(); err == lifecycle.InterruptError {
+		return false
+	}
+	if _, interrupted := utils.ChanTryPop(interrupter); interrupted {
+		return false
+	}
+	return true
+}
+
+// loadIndexCache 在初始化时从数据库中加载最早的和最新的索引缓存
+func (m *dbMetaManager) loadIndexCache(interrupter chan struct{}) bool {
+	if err := lifecycle.MakeRetry(lifecycle.Retry{
+		Do: func() error {
+			var indexes []*Index
+			if res := m.indexTable().Order("seq desc").Limit(int(m.lastIndexMaxCache)).Find(&indexes); res.Error != nil {
+				m.Logger().ErrorWith("list last index error", res.Error, log.Uint("list limit", m.lastIndexMaxCache))
+				return res.Error
+			}
+			m.Logger().Info("list last index success", log.Int("list index count", len(indexes)))
+			m.indexLock.Lock()
+			lastSeq := uint64(0)
+			for i := len(indexes) - 1; i >= 0; i-- {
+				if index := indexes[i]; index.Seq > lastSeq {
+					m.lastIndexCache.Put(index.Seq, index)
+					lastSeq = index.Seq
+				}
+			}
+			m.indexLock.Unlock()
+			return nil
+		},
+		MaxRetry:    -1,
+		Interrupter: interrupter,
+	}).Todo(); err == lifecycle.InterruptError {
+		return false
+	}
+	if _, interrupted := utils.ChanTryPop(interrupter); interrupted {
+		return false
+	}
+
+	if err := lifecycle.MakeRetry(lifecycle.Retry{
+		Do: func() error {
+			return m.loadFirstIndexes()
+		},
+		MaxRetry:    -1,
+		Interrupter: interrupter,
+	}).Todo(); err == lifecycle.InterruptError {
+		return false
+	}
+	if _, interrupted := utils.ChanTryPop(interrupter); interrupted {
+		return false
+	}
+	return true
+}
+
+// updateChannel 更新数据库中的channel信息
+func (m *dbMetaManager) updateChannel(retry bool, interrupter chan struct{}) error {
+	m.channelLock.Lock()
+	channelInfo := m.channelInfo.Clone()
+	m.channelLock.Unlock()
+
+	if retry {
+		if err := lifecycle.MakeRetry(lifecycle.Retry{
+			Do: func() error {
+				if res := m.channelInfoTable().Select("time_offset").Updates(channelInfo); res.Error != nil {
+					m.Logger().ErrorWith("update channel info error", res.Error)
+					return res.Error
+				}
+				return nil
+			},
+			MaxRetry:    -1,
+			Interrupter: interrupter,
+		}).Todo(); err == lifecycle.InterruptError {
+			return lifecycle.InterruptError
+		}
+	} else {
+		if res := m.channelInfoTable().Select("time_offset").Updates(channelInfo); res.Error != nil {
+			m.Logger().ErrorWith("channel not be updated, because update channel info error", res.Error)
+			return nil
+		}
+		return nil
+	}
+
+	m.Logger().Info("update channel info success", log.Object("channel info", channelInfo))
+	return nil
+}
+
+// channelUpdaterRun 异步更新数据库中channel信息的运行函数
+func (m *dbMetaManager) channelUpdaterRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case <-m.channelUpdateSignal:
+			if err := m.updateChannel(true, interrupter); err == lifecycle.InterruptError {
+				m.updateChannel(false, nil)
+				return nil
+			}
+		case <-interrupter:
+			m.updateChannel(false, nil)
+			return nil
+		}
+	}
+}
+
+// firstIndexesLoaderRun 异步从数据库中加载最早索引信息的运行函数
+func (m *dbMetaManager) firstIndexesLoaderRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case <-m.firstIndexLoadSignal:
+			m.loadFirstIndexes()
+		case <-interrupter:
+			return nil
+		}
+	}
+}
+
+// createIndex 向数据库中添加索引信息
+func (m *dbMetaManager) createIndex(retry bool, interrupter chan struct{}) error {
+	for {
+		m.indexLock.Lock()
+		first, exist := m.needRefreshedIndex.First()
+		if !exist {
+			m.indexLock.Unlock()
+			break
+		}
+		index := first.Clone()
+		m.indexLock.Unlock()
+
+		if retry {
+			if err := lifecycle.MakeRetry(lifecycle.Retry{
+				Do: func() error {
+					if res := m.indexTable().Create(index); res.Error != nil {
+						m.Logger().ErrorWith("create index error", res.Error)
+						return res.Error
+					}
+					return nil
+				},
+				MaxRetry:    -1,
+				Interrupter: interrupter,
+			}).Todo(); err == lifecycle.InterruptError {
+				return lifecycle.InterruptError
+			}
+		} else {
+			if res := m.indexTable().Create(index); res.Error != nil {
+				m.Logger().ErrorWith("index dropped, because create index error", res.Error)
+				m.indexLock.Lock()
+				m.lastIndexCache.PutEntry(m.needRefreshedIndex.RemoveFirst())
+				m.indexLock.Unlock()
+				continue
+			}
+		}
+
+		m.indexLock.Lock()
+		m.lastIndexCache.PutEntry(m.needRefreshedIndex.RemoveFirst())
+		m.indexLock.Unlock()
+
+		m.Logger().Debug("create index success", log.Object("index", index))
+	}
+	return nil
+}
+
+// fileCreatorRun 异步向数据库中添加索引信息的运行函数
+func (m *dbMetaManager) indexCreatorRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case <-m.indexCreateSignal:
+			if err := m.createIndex(true, interrupter); err == lifecycle.InterruptError {
+				m.createIndex(false, nil)
+				return nil
+			}
+		case <-interrupter:
+			m.createIndex(false, nil)
+			return nil
+		}
+	}
+}
+
+// deleteIndex 从数据库中删除索引信息
+func (m *dbMetaManager) deleteIndex(retry bool, interrupter chan struct{}) error {
+	for {
+		m.indexDeleteLock.Lock()
+		first, exist := m.needDeletedIndex.First()
+		if !exist {
+			m.indexDeleteLock.Unlock()
+			break
+		}
+		index := first.Clone()
+		m.indexDeleteLock.Unlock()
+
+		if retry {
+			if err := lifecycle.MakeRetry(lifecycle.Retry{
+				Do: func() error {
+					if res := m.indexTable().Delete(index); res.Error != nil {
+						m.Logger().ErrorWith("delete index error", res.Error)
+						return res.Error
+					}
+					return nil
+				},
+				MaxRetry:    -1,
+				Interrupter: interrupter,
+			}).Todo(); err == lifecycle.InterruptError {
+				return lifecycle.InterruptError
+			}
+		} else {
+			if res := m.indexTable().Delete(index); res.Error != nil {
+				m.Logger().ErrorWith("index not be deleted, because delete index error", res.Error)
+				m.indexDeleteLock.Lock()
+				m.needDeletedIndex.RemoveFirst()
+				m.indexDeleteLock.Unlock()
+				continue
+			}
+		}
+
+		m.indexDeleteLock.Lock()
+		m.needDeletedIndex.RemoveFirst()
+		m.indexDeleteLock.Unlock()
+
+		m.Logger().Debug("delete index success", log.Object("index", index))
+	}
+	return nil
+}
+
+// fileCreatorRun 异步从数据库中删除索引信息的运行函数
+func (m *dbMetaManager) indexDeleterRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case <-m.indexDeleteSignal:
+			if err := m.deleteIndex(true, interrupter); err == lifecycle.InterruptError {
+				m.deleteIndex(false, nil)
+				return nil
+			}
+		case <-interrupter:
+			m.deleteIndex(false, nil)
+			return nil
+		}
+	}
+}
+
+// createFile 添加文件信息到数据库
+func (m *dbMetaManager) createFile(retry bool, interrupter chan struct{}) error {
+	for {
+		m.filesLock.Lock()
+		first, exist := m.needRefreshedFiles.First()
+		if !exist {
+			m.filesLock.Unlock()
+			break
+		}
+		file := first.Clone()
+		m.filesLock.Unlock()
+
+		if retry {
+			if err := lifecycle.MakeRetry(lifecycle.Retry{
+				Do: func() error {
+					if res := m.fileTable().Create(file); res.Error != nil {
+						m.Logger().ErrorWith("create file info error", res.Error)
+						return res.Error
+					}
+					return nil
+				},
+				MaxRetry:    -1,
+				Interrupter: interrupter,
+			}).Todo(); err == lifecycle.InterruptError {
+				return lifecycle.InterruptError
+			}
+		} else {
+			if res := m.fileTable().Create(file); res.Error != nil {
+				m.Logger().ErrorWith("file info dropped, because create file info error", res.Error)
+
+				m.filesLock.Lock()
+				m.needRefreshedFiles.RemoveFirst()
+				m.files.Put(first.File.Seq, first.File)
+				m.filesLock.Unlock()
+
+				first.notifyCreated(res.Error)
+				continue
+			}
+		}
+
+		m.filesLock.Lock()
+		m.needRefreshedFiles.RemoveFirst()
+		m.files.Put(first.File.Seq, first.File)
+		m.filesLock.Unlock()
+
+		first.notifyCreated(nil)
+
+		m.Logger().Info("create file info success", log.Object("file info", file))
+	}
+	return nil
+}
+
+// fileCreatorRun 异步向数据库中添加文件信息的运行函数
+func (m *dbMetaManager) fileCreatorRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case <-m.fileCreateSignal:
+			if err := m.createFile(true, interrupter); err == lifecycle.InterruptError {
+				m.createFile(false, nil)
+				return nil
+			}
+		case <-interrupter:
+			m.createFile(false, nil)
+			return nil
+		}
+	}
+}
+
+// updateFile 更新数据库中的文件信息
+func (m *dbMetaManager) updateFile(retry bool, interrupter chan struct{}) error {
+	for {
+		// get first file to be updated
+		m.fileUpdateLock.Lock()
+		first, exist := m.needUpdatedFiles.First()
+		if !exist {
+			m.fileUpdateLock.Unlock()
+			break
+		}
+		file := first.Clone()
+		m.fileUpdateLock.Unlock()
+
+		if !first.Created() {
+			// first file creating, wait file created
+			select {
+			case err := <-first.CreatedFuture(nil):
+				if err != nil {
+					m.Logger().Warn("file info not be updated, because file create failed", log.Object("file info", file))
+					m.fileUpdateLock.Lock()
+					m.needUpdatedFiles.RemoveFirst()
+					m.fileUpdateLock.Unlock()
+					continue
+				}
+			case <-interrupter:
+				return lifecycle.InterruptError
+			}
+		}
+
+		// do update
+		if retry {
+			if err := lifecycle.MakeRetry(lifecycle.Retry{
+				Do: func() error {
+					if res := m.fileTable().Select(first.fields).Updates(file); res.Error != nil {
+						m.Logger().ErrorWith("update file info error", res.Error)
+						return res.Error
+					}
+					return nil
+				},
+				MaxRetry:    -1,
+				Interrupter: interrupter,
+			}).Todo(); err == lifecycle.InterruptError {
+				return lifecycle.InterruptError
+			}
+		} else {
+			if res := m.fileTable().Select(first.fields).Updates(file); res.Error != nil {
+				m.Logger().ErrorWith("file not be updated, because update file info error", res.Error)
+				m.fileUpdateLock.Lock()
+				m.needUpdatedFiles.RemoveFirst()
+				m.fileUpdateLock.Unlock()
+				continue
+			}
+		}
+
+		// remove first update context
+		m.fileUpdateLock.Lock()
+		m.needUpdatedFiles.RemoveFirst()
+		m.fileUpdateLock.Unlock()
+
+		m.Logger().Info("update file info success", log.Object("file info", file))
+	}
+	return nil
+}
+
+// fileUpdaterRun 异步更新数据库中文件信息的运行函数
+func (m *dbMetaManager) fileUpdaterRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case <-m.fileUpdateSignal:
+			if err := m.updateFile(true, interrupter); err == lifecycle.InterruptError {
+				m.updateFile(false, nil)
+				return nil
+			}
+		case <-interrupter:
+			m.updateFile(false, nil)
+			return nil
+		}
+	}
+}
+
+// deleteFile 从数据库中删除文件信息
+func (m *dbMetaManager) deleteFile(retry bool, interrupter chan struct{}) error {
+	for {
+		// get first file to be deleted
+		m.fileDeleteLock.Lock()
+		first, exist := m.needDeletedFiles.First()
+		if !exist {
+			m.fileDeleteLock.Unlock()
+			break
+		}
+		file := first.Clone()
+		m.fileDeleteLock.Unlock()
+
+		if !first.Created() {
+			// first file creating, wait file created
+			select {
+			case err := <-first.CreatedFuture(nil):
+				if err != nil {
+					m.Logger().Warn("file info not be deleted, because file create failed", log.Object("file info", file))
+					m.fileDeleteLock.Lock()
+					m.needDeletedFiles.RemoveFirst()
+					m.fileDeleteLock.Unlock()
+					continue
+				}
+			case <-interrupter:
+				return lifecycle.InterruptError
+			}
+		}
+
+		// do delete
+		if retry {
+			if err := lifecycle.MakeRetry(lifecycle.Retry{
+				Do: func() error {
+					if res := m.fileTable().Delete(file); res.Error != nil {
+						m.Logger().ErrorWith("delete file info error", res.Error)
+						return res.Error
+					}
+					return nil
+				},
+				MaxRetry:    -1,
+				Interrupter: interrupter,
+			}).Todo(); err == lifecycle.InterruptError {
+				return lifecycle.InterruptError
+			}
+		} else {
+			if res := m.fileTable().Delete(file); res.Error != nil {
+				m.Logger().ErrorWith("file not be deleted, because delete file info error", res.Error)
+				m.fileDeleteLock.Lock()
+				m.needDeletedFiles.RemoveFirst()
+				m.fileDeleteLock.Unlock()
+				continue
+			}
+		}
+
+		// remove first delete context
+		m.fileDeleteLock.Lock()
+		m.needDeletedFiles.RemoveFirst()
+		m.fileDeleteLock.Unlock()
+
+		m.Logger().Info("delete file info success", log.Object("file info", file))
+	}
+	return nil
+}
+
+// fileDeleterRun 异步从数据库中删除文件信息的运行函数
+func (m *dbMetaManager) fileDeleterRun(interrupter chan struct{}) error {
+	for {
+		select {
+		case <-m.fileDeleteSignal:
+			if err := m.deleteFile(true, interrupter); err == lifecycle.InterruptError {
+				m.deleteFile(false, nil)
+				return nil
+			}
+		case <-interrupter:
+			m.deleteFile(false, nil)
+			return nil
+		}
+	}
+}
+
+func (m *dbMetaManager) run(interrupter chan struct{}) error {
+	if !m.openDB(interrupter) {
+		m.Logger().Warn("open database interrupt")
+		return nil
+	}
+	if !m.loadChannelInfo(interrupter) {
+		m.Logger().Warn("load channel info interrupt")
+		return nil
+	}
+	if !m.ensureIndexTable(interrupter) {
+		m.Logger().Warn("ensure index table interrupt")
+		return nil
+	}
+	if !m.ensureFileTable(interrupter) {
+		m.Logger().Warn("ensure file table interrupt")
+		return nil
+	}
+	if !m.listFile(interrupter) {
+		m.Logger().Warn("list file interrupt")
+		return nil
+	}
+	if !m.loadIndexCache(interrupter) {
+		m.Logger().Warn("load index cache interrupt")
+		return nil
+	}
+
+	fmt.Println("index loaded")
+
+	select {
+	case <-interrupter:
+		return nil
+	default:
+	}
+	m.runner.TriggerCustomState("index loaded")
+
+	_, channelUpdater := lifecycle.NewOnce(fmt.Sprintf("storage channel updater(%s)", m.channel.Name()),
+		lifecycle.Context(m.channelUpdaterRun),
+	)
+
+	_, firstIndexesLoader := lifecycle.NewOnce(fmt.Sprintf("storage first indexes loader(%s)", m.channel.Name()),
+		lifecycle.Context(m.firstIndexesLoaderRun),
+	)
+
+	_, indexCreator := lifecycle.NewOnce(fmt.Sprintf("storage index creator(%s)", m.channel.Name()),
+		lifecycle.Context(m.indexCreatorRun),
+	)
+
+	_, indexDeleter := lifecycle.NewOnce(fmt.Sprintf("storage index deleter(%s)", m.channel.Name()),
+		lifecycle.Context(m.indexDeleterRun),
+	)
+
+	_, fileCreator := lifecycle.NewOnce(fmt.Sprintf("storage file info creator(%s)", m.channel.Name()),
+		lifecycle.Context(m.fileCreatorRun),
+	)
+
+	_, fileUpdater := lifecycle.NewOnce(fmt.Sprintf("storage file info updater(%s)", m.channel.Name()),
+		lifecycle.Context(m.fileUpdaterRun),
+	)
+
+	_, fileDeleter := lifecycle.NewOnce(fmt.Sprintf("storage file info deleter(%s)", m.channel.Name()),
+		lifecycle.Context(m.fileDeleterRun),
+	)
+
+	select {
+	case <-interrupter:
+		channelUpdater.Close(nil)
+		firstIndexesLoader.Close(nil)
+		indexCreator.Close(nil)
+		indexDeleter.Close(nil)
+		fileCreator.Close(nil)
+		fileUpdater.Close(nil)
+		fileDeleter.Close(nil)
+	}
+
+	channelUpdater.Wait()
+	firstIndexesLoader.Wait()
+	indexCreator.Wait()
+	indexDeleter.Wait()
+	fileCreator.Wait()
+	fileUpdater.Wait()
+	fileDeleter.Wait()
+
+	m.Logger().Info("db metadata manager closed")
+
+	return nil
+}
+
+// loadFirstIndexes 查询数据库加载或扩充最早的 index 缓存，由 firstIndexesLoader 运行时调用
+func (m *dbMetaManager) loadFirstIndexes() error {
+	var findRange bool
+	var findStart, findEnd uint64
+	var expectFound uint64
+	var preLoaded []*Index
+
+	m.indexLock.Lock()
+	if m.firstIndexCache.Size() >= m.firstIndexMaxCache {
+		// 最早的 index 缓存不需要被扩充
+		m.indexLock.Unlock()
+		return nil
+	}
+	// 计算出最早的 index 缓存期望被扩充的大小
+	expectFound = uint64(m.firstIndexMaxCache - m.firstIndexCache.Size())
+	if m.firstIndexCache.Size() > 0 {
+		// 最早的 index 已被缓存
+		firstLast, _ := m.firstIndexCache.Last()
+		lastFirst, exist := m.lastIndexCache.First()
+		if !exist {
+			m.indexLock.Unlock()
+			return nil
+		}
+		if firstLast.Seq+1 >= lastFirst.Seq {
+			// 最新的 index 缓存包含了所有需要被扩充的 index，使用最新的 index 缓存来填充最早的 index缓
+			// 存，不需要查询数据库
+			m.growFirstIndexesFromLastIndexCache()
+			m.indexLock.Unlock()
+			return nil
+		}
+		// 由于最早的 index 已被缓存，使用范围查找去查找数据库，范围为最早的 index 缓存的最后一个（不包括）
+		// 到最新的 index 缓存的第一个（不包含），maxFound 为这个范围内最多可以查找到的 index
+		findRange = true
+		findStart, findEnd = firstLast.Seq, lastFirst.Seq
+		maxFound := findEnd - findStart - 1
+		if maxFound < expectFound {
+			// 这个范围内最多可以查找的数据量小于期望被扩充的大小，那么剩余的 index 从最新的 index 缓存
+			// 中填充，此时预先将这些 index 预先提取出来（因为后面在查找数据库时，可能改变最新的 index 缓
+			// 存，此时由于对 index 缓存已经加锁，index 缓存不会变化），这些 index 也不需要查询数据库
+			entry := m.lastIndexCache.FirstEntry()
+			for i := uint64(0); i < expectFound-maxFound && entry != nil; i++ {
+				preLoaded = append(preLoaded, entry.Value())
+				entry = entry.Next()
+			}
+		}
+	}
+	m.indexLock.Unlock()
+
+	// load index from database
+	var indexes []*Index
+	if findRange {
+		// 使用范围查找去查找数据库
+		if res := m.indexTable().Where("seq > ? AND seq < ?", findStart, findEnd).Order("seq").
+			Limit(int(expectFound)).Find(&indexes); res.Error != nil {
+			m.Logger().ErrorWith("list first indexes error", res.Error,
+				log.Uint64("greater than seq", findStart),
+				log.Uint64("less then seq", findEnd),
+			)
+			return res.Error
+		}
+		m.Logger().Info("list first index success", log.Int("list index count", len(indexes)))
+	} else {
+		// 从数据库中的第一个开始查找
+		if res := m.indexTable().Order("seq").Limit(int(expectFound)).Find(&indexes); res.Error != nil {
+			m.Logger().ErrorWith("list first indexes error", res.Error, log.Uint("list limit", m.firstIndexMaxCache))
+			return res.Error
+		}
+		m.Logger().Info("list first indexes success", log.Int("list index count", len(indexes)))
+	}
+
+	m.indexLock.Lock()
+	// 获取到最早的 index 缓存的最后一个 index 序列号和最新的 index 缓存的第一个 index 序列号，填充的范围
+	// 这之间
+	var firstLastSeq uint64
+	var lastFirstSeq = uint64(math.MaxUint64)
+	firstLast, exist := m.firstIndexCache.First()
+	if exist {
+		firstLastSeq = firstLast.Seq
+	}
+	lastFirst, exist := m.lastIndexCache.First()
+	if exist {
+		lastFirstSeq = lastFirst.Seq
+	}
+	if len(preLoaded) > 0 {
+		lastFirstSeq = preLoaded[0].Seq
+	}
+	if findRange {
+		for _, index := range indexes {
+			if index.Seq > firstLastSeq && index.Seq < lastFirstSeq {
+				m.firstIndexCache.Put(index.Seq, index)
+				firstLastSeq = index.Seq
+			} else {
+				m.Logger().Warn("dropped invalid index", log.Object("index", index))
+			}
+		}
+	} else {
+		for _, index := range indexes {
+			if index.Seq > firstLastSeq {
+				if index.Seq >= lastFirstSeq {
+					break
+				}
+				m.firstIndexCache.Put(index.Seq, index)
+				firstLastSeq = index.Seq
+				expectFound--
+			} else {
+				m.Logger().Warn("dropped invalid index", log.Object("index", index))
+			}
+		}
+		entry := m.lastIndexCache.FirstEntry()
+		for i := uint64(0); i < expectFound && entry != nil; i++ {
+			m.firstIndexCache.Put(entry.Key(), entry.Value())
+			entry = entry.Next()
+		}
+	}
+	for _, index := range preLoaded {
+		m.firstIndexCache.Put(index.Seq, index)
+	}
+	m.indexLock.Unlock()
+	return nil
+}
+
+func (m *dbMetaManager) loadFirstIndexes1() error {
+	var findRange bool
+	var findStart, findEnd uint64
+	var expectFound uint64
+	var preLoaded []*Index
+
+	m.indexLock.Lock()
+	_len, _cap := m.earliestIndexCache.Len(), m.earliestIndexCache.Cap()
+	if _len == _cap {
+		// 最早的索引缓存不需要被扩充
+		m.indexLock.Unlock()
+		return nil
+	}
+	// 计算出最早的索引缓存期望被扩充的大小
+	expectFound = uint64(_cap - _len)
+	if _len > 0 {
+		// 最早的索引已被缓存
+		earliestLast := m.earliestIndexCache.Last()
+		latestFirst := m.latestIndexCache.First()
+		if latestFirst == nil {
+			m.indexLock.Unlock()
+			return nil
+		}
+		if earliestLast.Seq+1 >= latestFirst.Seq {
+			// 最新的索引缓存包含了所有需要被扩充的索引，使用最新的索引缓存来填充最早的索引缓存，不需要查询数
+			// 据库
+			m.growFirstIndexesFromLastIndexCache1()
+			m.indexLock.Unlock()
+			return nil
+		}
+		// 由于最早的索引已被缓存，使用范围查找去查找数据库，范围为最早的索引缓存的最后一个（不包括）到最新的索
+		// 引缓存的第一个（不包含），maxFound 为这个范围内最多可以查找到的索引
+		findRange = true
+		findStart, findEnd = earliestLast.Seq, latestFirst.Seq
+		maxFound := findEnd - findStart - 1
+		if maxFound < expectFound {
+			// 这个范围内最多可以查找的数据量小于期望被扩充的大小，那么剩余的索引从最新的索引缓存中填充，此时预
+			// 先将这些索引预先提取出来（因为后面在查找数据库时，可能改变最新的索引缓存，此时由于对索引缓存已经
+			// 加锁，因此索引缓存不会变化），这些索引也不需要查询数据库
+			entry := m.lastIndexCache.FirstEntry()
+			for i := uint64(0); i < expectFound-maxFound && entry != nil; i++ {
+				preLoaded = append(preLoaded, entry.Value())
+				entry = entry.Next()
+			}
+		}
+	}
+	m.indexLock.Unlock()
+
+	// load index from database
+	var indexes []*Index
+	if findRange {
+		// 使用范围查找去查找数据库
+		if res := m.indexTable().Where("seq > ? AND seq < ?", findStart, findEnd).Order("seq").
+			Limit(int(expectFound)).Find(&indexes); res.Error != nil {
+			m.Logger().ErrorWith("list first indexes error", res.Error,
+				log.Uint64("greater than seq", findStart),
+				log.Uint64("less then seq", findEnd),
+			)
+			return res.Error
+		}
+		m.Logger().Info("list first index success", log.Int("list index count", len(indexes)))
+	} else {
+		// 从数据库中的第一个开始查找
+		if res := m.indexTable().Order("seq").Limit(int(expectFound)).Find(&indexes); res.Error != nil {
+			m.Logger().ErrorWith("list first indexes error", res.Error, log.Uint("list limit", m.firstIndexMaxCache))
+			return res.Error
+		}
+		m.Logger().Info("list first indexes success", log.Int("list index count", len(indexes)))
+	}
+
+	m.indexLock.Lock()
+	// 获取到最早的索引缓存的最后一个索引序列号和最新的索引缓存的第一个索引序列号，填充的范围
+	// 这之间
+	var firstLastSeq uint64
+	var lastFirstSeq = uint64(math.MaxUint64)
+	firstLast, exist := m.firstIndexCache.First()
+	if exist {
+		firstLastSeq = firstLast.Seq
+	}
+	lastFirst, exist := m.lastIndexCache.First()
+	if exist {
+		lastFirstSeq = lastFirst.Seq
+	}
+	if len(preLoaded) > 0 {
+		lastFirstSeq = preLoaded[0].Seq
+	}
+	if findRange {
+		for _, index := range indexes {
+			if index.Seq > firstLastSeq && index.Seq < lastFirstSeq {
+				m.firstIndexCache.Put(index.Seq, index)
+				firstLastSeq = index.Seq
+			} else {
+				m.Logger().Warn("dropped invalid index", log.Object("index", index))
+			}
+		}
+	} else {
+		for _, index := range indexes {
+			if index.Seq > firstLastSeq {
+				if index.Seq >= lastFirstSeq {
+					break
+				}
+				m.firstIndexCache.Put(index.Seq, index)
+				firstLastSeq = index.Seq
+				expectFound--
+			} else {
+				m.Logger().Warn("dropped invalid index", log.Object("index", index))
+			}
+		}
+		entry := m.lastIndexCache.FirstEntry()
+		for i := uint64(0); i < expectFound && entry != nil; i++ {
+			m.firstIndexCache.Put(entry.Key(), entry.Value())
+			entry = entry.Next()
+		}
+	}
+	for _, index := range preLoaded {
+		m.firstIndexCache.Put(index.Seq, index)
+	}
+	m.indexLock.Unlock()
+	return nil
+}
+
+// growFirstIndexesFromLastIndexCache 加载或扩充最早的索引缓存使用最新的索引缓存，必须保证最新的索引缓存包
+// 含所有需要扩充的索引
+func (m *dbMetaManager) growFirstIndexesFromLastIndexCache() {
+	firstLast, _ := m.firstIndexCache.Last()
+	need := m.firstIndexMaxCache - m.firstIndexCache.Size()
+	entry := m.lastIndexCache.GetEntry(firstLast.Seq)
+	if entry == nil {
+		entry = m.lastIndexCache.FirstEntry()
+	} else {
+		entry = entry.Next()
+	}
+	for i := uint(0); i < need && entry != nil; i++ {
+		m.firstIndexCache.Put(entry.Key(), entry.Value())
+		entry = entry.Next()
+	}
+}
+
+func (m *dbMetaManager) growFirstIndexesFromLastIndexCache1() {
+	earliestLast := m.earliestIndexCache.Last()
+	need := m.earliestIndexCache.Cap() - m.earliestIndexCache.Len()
+	i, _ := m.latestIndexCache.FindBySeq(earliestLast.Seq + 1)
+	for j, l := 0, m.latestIndexCache.Len(); j < need && i < l; j++ {
+		if !m.earliestIndexCache.Add(m.latestIndexCache.Index(i), false) {
+			panic(errors.New("earliest index cache is full, cannot continue to add new cache"))
+		}
+	}
+}
+
+// growFirstIndexes 加载或扩充最早的索引缓存
+func (m *dbMetaManager) growFirstIndexes() {
+	if m.firstIndexCache.Size() == 0 {
+		// 最早的索引缓存为空，需要查询数据库加载，异步加载索引缓存
+		if !utils.ChanTryPush(m.firstIndexLoadSignal, struct{}{}) {
+			m.Logger().Warn("first index load signal channel full, ignore current signal")
+		}
+		return
+	}
+	lastFirst, exist := m.lastIndexCache.First()
+	if exist {
+		firstLast, _ := m.firstIndexCache.Last()
+		if firstLast.Seq+1 >= lastFirst.Seq {
+			// 最早的索引缓存包含了所有需要被扩充的索引，使用最新的索引缓存来填充最早的索引缓存，不需要查询数据库
+			m.growFirstIndexesFromLastIndexCache()
+		} else {
+			// 最早的索引 缓存需要查询数据库扩充，异步扩充索引缓存
+			if !utils.ChanTryPush(m.firstIndexLoadSignal, struct{}{}) {
+				m.Logger().Warn("first index load signal channel full, ignore current signal")
+			}
+		}
+	}
+}
+
+// FirstIndex 获取最早的索引，如果缓存中没有，则加载最早的索引缓存
+func (m *dbMetaManager) FirstIndex() *Index {
+	m.indexLock.Lock()
+	defer m.indexLock.Unlock()
+	first, exist := m.firstIndexCache.First()
+	if !exist {
+		m.growFirstIndexes()
+		return nil
+	}
+	return first.Clone()
+}
+
+func (m *dbMetaManager) lastIndex() *Index {
+	last, exist := m.needRefreshedIndex.Last()
+	if !exist {
+		last, exist = m.lastIndexCache.Last()
+	}
+	return last
+}
+
+// LastIndex 获取最新的索引
+func (m *dbMetaManager) LastIndex() *Index {
+	m.indexLock.Lock()
+	defer m.indexLock.Unlock()
+	return m.lastIndex()
+}
+
+func (m *dbMetaManager) LastIndex1() *Index {
+	m.indexLock.Lock()
+	defer m.indexLock.Unlock()
+	return m.latestIndexCache.Last()
+}
+
+// BuildIndex 添加了 index 的序列号，修正了 index 的起始时间和结束时间，如果 index 的时间不正确，异步修改通
+// 道的时间偏移
+func (m *dbMetaManager) BuildIndex(index *Index) *Index {
+	index.Seq = 1
+	if last := m.LastIndex(); last != nil {
+		index.Seq += last.Seq
+	}
+	// 根据通道时时间偏移修正 index 的开始时间和结束时间
+	index.Start += m.channelInfo.TimeOffset
+	index.End += m.channelInfo.TimeOffset
+	last := m.LastIndex()
+	if last != nil {
+		if index.Start < last.End {
+			// index 的开始时间在上一个 index 之前，时间发生跳变，需要修改通道时时间偏移
+			offset := last.End - last.Start
+			m.channelInfo.TimeOffset += offset
+			last.Start += offset
+			last.End += offset
+			if !utils.ChanTryPush(m.channelUpdateSignal, struct{}{}) {
+				m.Logger().Warn("channel info update signal channel full, ignore current signal")
+			}
+			m.Logger().Warn("index start time before last index end time, time offset will be set", log.Int64("offset", offset))
+		}
+	}
+	return index
+}
+
+func (m *dbMetaManager) BuildIndex1(index *Index) *Index {
+	index.Seq = 1
+	last := m.latestIndexCache.Last()
+	if last != nil {
+		index.Seq += last.Seq
+	}
+	// 根据通道时时间偏移修正 index 的开始时间和结束时间
+	index.Start += m.channelInfo.TimeOffset
+	index.End += m.channelInfo.TimeOffset
+	if last != nil {
+		if index.Start < last.End {
+			// index 的开始时间在上一个 index 之前，时间发生跳变，需要修改通道时时间偏移
+			offset := last.End - last.Start
+			m.channelInfo.TimeOffset += offset
+			last.Start += offset
+			last.End += offset
+			if !utils.ChanTryPush(m.channelUpdateSignal, struct{}{}) {
+				m.Logger().Warn("channel info update signal channel full, ignore current signal")
+			}
+			m.Logger().Warn("index start time before last index end time, time offset will be set", log.Int64("offset", offset))
+		}
+	}
+	return index
+}
+
+// AddIndex 向索引缓存和数据库中添加一个索引，需要先调用 BuildIndex 方法构建这个索引，和 BuildIndex 方法一起使用时
+// 不可以并发调用
+func (m *dbMetaManager) AddIndex(index *Index) error {
+	if m.GetFile(index.FileSeq) == nil {
+		return IndexFileNotExistError
+	}
+
+	m.indexLock.Lock()
+	last := m.lastIndex()
+	if last != nil && index.Seq <= last.Seq {
+		m.indexLock.Unlock()
+		return InvalidIndexSeqError
+	}
+	var put, drop = true, false
+	var first *Index
+	// 清理最新的 index 缓存
+	for m.lastIndexCache.Size()+m.needRefreshedIndex.Size() >= m.lastIndexMaxCache && m.lastIndexCache.Size() > 0 {
+		// 最新的 index 缓存容量已满，并且存在已经刷新到数据库的 index，则清除缓存中最早的 index
+		first = m.lastIndexCache.RemoveFirst().Value()
+	}
+	if m.lastIndexCache.Size()+m.needRefreshedIndex.Size() >= m.lastIndexMaxCache {
+		// 最新的 index 缓存容量已满，并且所有缓存的 index 都未被刷新到数据库，丢弃此 index，第一个被丢弃的
+		// index 将被标记 IndexStateDropped，后面被丢弃的 index 将合并到第一个被丢弃的 index 中
+		drop = true
+		if last != nil && last.State&IndexStateDropped != 0 {
+			// 上一个最新的 index 被标记丢弃，此 index 合并到上一个 index 中
+			last.End = index.End
+			put = false
+		} else {
+			// 第一个被丢弃的 index，标记并修改此 index
+			index.FileSeq = 0
+			index.FileOffset = 0
+			index.Size = 0
+			index.State = IndexStateDropped
+		}
+	}
+	if put {
+		m.needRefreshedIndex.Put(index.Seq, index.Clone())
+
+	}
+	m.indexLock.Unlock()
+
+	// 解锁后打印需要打印的日志，避免占有 index 缓存锁太长时间
+	if first != nil {
+		m.Logger().Debug("index cache full, remove earliest index from cache", log.Object("index", first))
+	}
+	if drop {
+		m.Logger().Warn("index not refreshed queue full, new index will be dropped", log.Uint64("index seq", index.Seq))
+	}
+	if put && !utils.ChanTryPush(m.indexCreateSignal, struct{}{}) {
+		m.Logger().Warn("index create signal channel full, ignore current signal")
+	}
+	return nil
+}
+
+func (m *dbMetaManager) AddIndex1(index *Index) {
+	if m.GetFile(index.FileSeq) == nil {
+		panic(fmt.Errorf("file info sequence(%d) not fount", index.FileSeq))
+	}
+
+	var put, drop = true, false
+	var earliest *Index
+	m.indexLock.Lock()
+	if _len, _cap := m.latestIndexCache.Len(), m.latestIndexCache.Cap(); _len+1 >= _cap {
+		// 最新的索引缓存容量已满，latest index cache 保留的一个空间用来存放被丢弃的索引
+		if m.needRefreshed < _len {
+			// 最新的索引缓存容量已满，并且存在已经刷新到数据库的索引，则清除缓存中最早的索引
+			earliest = m.latestIndexCache.Remove()
+		} else {
+			// 最新的索引缓存容量已满，并且所有缓存的索引都未被刷新到数据库，丢弃此索引，第一个被丢弃的索引将被标记
+			// IndexStateDropped，后面被丢弃的索引将合并到第一个被丢弃的索引中
+			drop = true
+			if _len == _cap {
+				// 上一个最新的 index 被标记丢弃，此 index 合并到上一个 index 中
+				last := m.latestIndexCache.Last()
+				if last.State != IndexStateDropped {
+					m.indexLock.Unlock()
+					panic(fmt.Errorf("if latest index cache is full, latest index state must be %s, but its state is %s",
+						IndexStateString(IndexStateDropped),
+						IndexStateString(last.State),
+					))
+				}
+				m.latestIndexCache.Last().End = index.End
+				put = false
+			} else {
+				// 第一个被丢弃的 index，标记并修改此 index
+				index.FileSeq = 0
+				index.FileOffset = 0
+				index.Size = 0
+				index.State = IndexStateDropped
+			}
+		}
+	}
+	if put {
+		if !m.latestIndexCache.Add(index, false) {
+			m.indexLock.Unlock()
+			panic(errors.New("latest index cache is full, cannot continue to add new cache"))
+		}
+		m.needRefreshed++
+	}
+	m.indexLock.Unlock()
+
+	if earliest != nil {
+		m.Logger().Debug("latest index cache full, remove earliest index from cache", log.Object("index", earliest))
+	}
+	if drop {
+		m.Logger().Warn("latest index cache full and all indexes not refreshed, new index will be dropped", log.Uint64("index seq", index.Seq))
+	}
+	if put && !utils.ChanTryPush(m.indexCreateSignal, struct{}{}) {
+		m.Logger().Warn("index create signal channel full, ignore current signal")
+	}
+}
+
+// DeleteIndex 从缓存中删除最早的 index，并异步删除数据库中对应的 index
+func (m *dbMetaManager) DeleteIndex() error {
+	m.indexLock.Lock()
+	defer m.indexLock.Unlock()
+
+	// 从最早的 index 缓存中获取最早的 index 并删除
+	first, exist := m.firstIndexCache.First()
+	if !exist {
+		return nil
+	}
+	m.firstIndexCache.RemoveFirst()
+
+	// 最早的 index 缓存数量小于最大缓存量的一半，扩充最早的 index 缓存
+	if m.firstIndexCache.Size() < m.firstIndexMaxCache/2 {
+		m.growFirstIndexes()
+	}
+	m.needDeletedIndex.Put(m.indexDeleteId, first)
+	m.indexDeleteId++
+	if !utils.ChanTryPush(m.indexDeleteSignal, struct{}{}) {
+		m.Logger().Warn("index delete signal channel full, ignore current signal")
+	}
+	return nil
+}
+
+// NewFile 创建一个文件信息结构体并填充一些基本信息（文件序列号，文件名，文件创建时间等）
+func (m *dbMetaManager) NewFile(createTime int64) *File {
+	seq := m.NextFileSeq()
+	m.channelLock.Lock()
+	channelInfo := m.channelInfo.Clone()
+	m.channelLock.Unlock()
+
+	createTime += channelInfo.TimeOffset
+	zone := time.FixedZone(channelInfo.Location, int(channelInfo.LocationOffset))
+	name := m.channel.FileNameFormatter()(m.channel, seq, time.UnixMilli(createTime).In(zone))
+	return &File{
+		Seq:        seq,
+		Name:       name,
+		Path:       path.Join(m.channel.Directory(), name),
+		CreateTime: createTime,
+	}
+}
+
+// AddFile 向文件信息缓存中添加一个文件的信息，并异步向数据库中添加
+func (m *dbMetaManager) AddFile(file *File) error {
+	m.filesLock.Lock()
+	defer m.filesLock.Unlock()
+	if m.files.Has(file.Seq) {
+		return FileAddedError
+	}
+	if _, exist := m.needRefreshedFiles.PutIfAbsent(file.Seq, newFileInfoCreateContext(file.Clone(), false)); exist {
+		return FileAddingError
+	}
+	if !utils.ChanTryPush(m.fileCreateSignal, struct{}{}) {
+		m.Logger().Warn("file create signal channel full, ignore current signal")
+	}
+	return nil
+}
+
+// UpdateFile 更新文件信息缓存中的文件信息，如果文件信息已经被添加到数据库，则异步刷新到数据库中的信息
+func (m *dbMetaManager) UpdateFile(file *File, fields ...string) error {
+	file = file.Clone()
+
+	m.filesLock.Lock()
+	m.fileUpdateLock.Lock()
+	defer m.filesLock.Unlock()
+	defer m.fileUpdateLock.Unlock()
+
+	_, exist := m.files.Get(file.Seq)
+	if exist {
+		// 文件信息已经被添加到数据库，需要更新数据库
+		m.files.Put(file.Seq, file)
+		m.needUpdatedFiles.Put(m.fileUpdateId, fileInfoUpdateContext{
+			fileInfoCreateContext: newFileInfoCreateContext(file, true),
+			fields:                fields,
+		})
+		m.fileUpdateId++
+	} else {
+		entry := m.needRefreshedFiles.GetEntry(file.Seq)
+		if entry == nil {
+			return FileNotExistError
+		}
+		ctx := entry.Value()
+		ctx.File = file
+		if entry.Prev() == nil {
+			// 文件信息未添加到数据库，但正在添加，等待添加完成后再更新数据库
+			m.needUpdatedFiles.Put(m.fileUpdateId, fileInfoUpdateContext{
+				fileInfoCreateContext: ctx,
+				fields:                fields,
+			})
+			m.fileUpdateId++
+		} else {
+			// 文件信息未添加到数据库，且未在添加，直接修改即可，不需要修改数据库
+			return nil
+		}
+	}
+	if !utils.ChanTryPush(m.fileUpdateSignal, struct{}{}) {
+		m.Logger().Warn("file update signal channel full, ignore current signal")
+	}
+	return nil
+}
+
+// DeleteFile 从文件信息缓存和数据库中删除最早的文件信息
+func (m *dbMetaManager) DeleteFile() error {
+	m.filesLock.Lock()
+	defer m.filesLock.Unlock()
+
+	first, exist := m.files.First()
+	if !exist {
+		return FileNotExistError
+	}
+	m.files.RemoveFirst()
+	m.needDeletedFiles.Put(m.fileDeleteId, fileInfoDeleteContext{
+		fileInfoCreateContext: newFileInfoCreateContext(first.Clone(), true),
+	})
+	m.fileDeleteId++
+	if !utils.ChanTryPush(m.fileDeleteSignal, struct{}{}) {
+		m.Logger().Warn("file delete signal channel full, ignore current signal")
+	}
+	return nil
+}
+
+func (m *dbMetaManager) getFile(seq uint64) *File {
+	// 先从已经刷新到数据库中的文件信息缓存中获取
+	file, exist := m.files.Get(seq)
+	if !exist {
+		// 再从未刷新到数据库中的文件信息缓存中获取
+		ctx, exist := m.needRefreshedFiles.Get(seq)
+		if !exist {
+			return nil
+		}
+		file = ctx.File
+	}
+	return file.Clone()
+}
+
+// GetFile 从文件信息缓存中获取指定序列号的文件信息
+func (m *dbMetaManager) GetFile(seq uint64) *File {
+	m.filesLock.Lock()
+	defer m.filesLock.Unlock()
+	return m.getFile(seq)
+}
+
+func (m *dbMetaManager) lastFile() *File {
+	var file *File
+	// 先从未刷新到数据库中的文件信息缓存中获取
+	ctx, exist := m.needRefreshedFiles.Last()
+	if !exist {
+		// 再从已经刷新到数据库中的文件信息缓存中获取
+		file, exist = m.files.Last()
+		if !exist {
+			return nil
+		}
+	} else {
+		file = ctx.File
+	}
+	return file.Clone()
+}
+
+// LastFile 从文件信息缓存中获取最新的文件信息
+func (m *dbMetaManager) LastFile() *File {
+	m.filesLock.Lock()
+	defer m.filesLock.Unlock()
+	return m.lastFile()
+}
+
+func (m *dbMetaManager) firstFile() *File {
+	// 先从已经刷新到数据库中的文件信息缓存中获取
+	file, exist := m.files.First()
+	if !exist {
+		// 再从未刷新到数据库中的文件信息缓存中获取
+		ctx, exist := m.needRefreshedFiles.First()
+		if !exist {
+			return nil
+		}
+		file = ctx.File
+	}
+	return file.Clone()
+}
+
+// FirstFile 从文件信息缓存中获取最早的文件信息
+func (m *dbMetaManager) FirstFile() *File {
+	m.filesLock.Lock()
+	defer m.filesLock.Unlock()
+	return m.firstFile()
+}
+
+// NextFileSeq 下一个被创建的文件的序列号
+func (m *dbMetaManager) NextFileSeq() uint64 {
+	if last := m.LastFile(); last != nil {
+		return last.Seq + 1
+	}
+	return 1
+}

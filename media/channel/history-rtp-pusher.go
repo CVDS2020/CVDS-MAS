@@ -1,0 +1,856 @@
+package channel
+
+import (
+	"bytes"
+	"gitee.com/sy_183/common/lifecycle"
+	"gitee.com/sy_183/common/log"
+	timerPkg "gitee.com/sy_183/common/timer"
+	"gitee.com/sy_183/common/utils"
+	"gitee.com/sy_183/cvds-mas/storage"
+	framePkg "gitee.com/sy_183/rtp/frame"
+	"gitee.com/sy_183/rtp/rtp"
+	rtpServer "gitee.com/sy_183/rtp/server"
+	"io"
+	"math/rand"
+	"net"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+	"unsafe"
+)
+
+const findIndexesLimit = 64
+
+type (
+	HistoryRTPPusherEOFCallback    func(pusher *HistoryRTPPusher, channel *Channel)
+	HistoryRTPPusherClosedCallback func(pusher *HistoryRTPPusher, channel *Channel)
+)
+
+type indexesFindRequest struct {
+	start int64
+	end   int64
+	limit int
+}
+
+type indexesFindResponse struct {
+	request *indexesFindRequest
+	indexes storage.Indexes
+	err     error
+}
+
+type indexGetter struct {
+	lifecycle.Lifecycle
+
+	storageChannel storage.Channel
+
+	startTime int64
+	endTime   int64
+	curTime   int64
+
+	eof     bool
+	nextEOF bool
+
+	curIndexes  storage.Indexes
+	curResponse *indexesFindResponse
+	curIndex    int
+
+	indexesBuf              storage.Indexes
+	indexesFindRequestChan  chan *indexesFindRequest
+	indexesFindResponseChan chan *indexesFindResponse
+
+	indexesFinding bool
+}
+
+func newIndexGetter(channel storage.Channel, startTime, endTime int64) *indexGetter {
+	getter := &indexGetter{
+		storageChannel: channel,
+
+		startTime: startTime,
+		endTime:   endTime,
+		curTime:   startTime,
+
+		curIndexes: channel.MakeIndexes(findIndexesLimit),
+		indexesBuf: channel.MakeIndexes(findIndexesLimit),
+
+		indexesFindRequestChan:  make(chan *indexesFindRequest, 1),
+		indexesFindResponseChan: make(chan *indexesFindResponse, 1),
+	}
+
+	getter.Lifecycle = lifecycle.NewWithInterruptedRun(nil, getter.indexesFinderRun)
+	return getter
+}
+
+func (g *indexGetter) indexesFinderRun(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	for {
+		select {
+		case req := <-g.indexesFindRequestChan:
+			indexes, err := g.storageChannel.FindIndexes(req.start, req.end, req.limit, g.indexesBuf)
+			if err != nil {
+				g.indexesFindResponseChan <- &indexesFindResponse{request: req, err: err}
+				continue
+			}
+			g.indexesFindResponseChan <- &indexesFindResponse{request: req, indexes: indexes}
+		case <-interrupter:
+			return nil
+		}
+	}
+}
+
+// getCurIndex 从 curIndexes 中获取当前位置的索引，并将当前位置加一
+func (g *indexGetter) getCurIndex() storage.Index {
+	index := g.curIndexes.Get(g.curIndex).CloneIndex()
+	g.curIndex++
+	return index
+}
+
+// nextStartTime 获取下一次可能包含的索引列表的起始时间
+func (g *indexGetter) nextStartTime() int64 {
+	startTime := g.curTime
+	if l := g.curIndexes.Len(); l > 0 {
+		startTime = g.curIndexes.Get(l - 1).EndTime()
+	}
+	return startTime
+}
+
+// load 从指定的开始时间请求索引列表
+func (g *indexGetter) load(startTime int64) {
+	if startTime < g.endTime {
+		g.indexesFindRequestChan <- &indexesFindRequest{start: startTime, end: g.endTime, limit: findIndexesLimit}
+		g.indexesFinding = true
+		g.nextEOF = false
+	} else {
+		g.indexesFinding = false
+		g.nextEOF = true
+	}
+}
+
+// getAfterLoadedFrom 从上次请求的响应中获取索引列表，并判断是否包含本次期望的索引范
+// 围，如果不包含则重新从本次期望范围请求并获取索引列表，与 getAfterLoaded 相同，在获
+// 取到索引列表后预先请求下一次可能包含的索引列表
+func (g *indexGetter) getAfterLoadedFrom(startTime int64) (storage.Index, error) {
+	res := <-g.indexesFindResponseChan
+	if res.err != nil {
+		if startTime == res.request.start {
+			// 上一次请求的开始时间与本次期望的开始时间一致，并且上一次请求失败，重新
+			// 发起上一次的请求
+			g.load(startTime)
+			return nil, res.err
+		}
+		// 上一次请求的开始时间与本次期望的开始时间不一致，忽略上一次的请求失败，本次
+		// 重新请求
+		g.load(startTime)
+		return g.getAfterLoaded()
+	}
+	g.curResponse = res
+	g.curIndexes, g.indexesBuf = res.indexes, g.curIndexes.Cut(0, 0)
+	if l := g.curIndexes.Len(); l == 0 || startTime == res.request.start {
+		g.curTime = res.request.start
+		g.curIndex = 0
+		if l == 0 {
+			g.eof = true
+			return nil, io.EOF
+		}
+		g.load(g.nextStartTime())
+		return g.getCurIndex(), nil
+	} else {
+		first := g.curIndexes.Get(0)
+		last := g.curIndexes.Get(l - 1)
+		firstStart := first.StartTime()
+		if g.curResponse.request.start < firstStart {
+			firstStart = g.curResponse.request.start
+		}
+		if startTime >= firstStart && startTime < last.EndTime() {
+			g.curResponse.request.start = startTime
+			g.curTime = startTime
+			g.curIndex = sort.Search(l, func(i int) bool {
+				return g.curIndexes.Get(i).EndTime() > startTime
+			})
+			g.load(g.nextStartTime())
+			return g.getCurIndex(), nil
+		}
+		return g.get(startTime)
+	}
+}
+
+// getAfterLoaded 从上次请求的响应中获取索引列表，并预先请求下一次可能包含的索引列表
+// ，下一次请求的求索引列表从上一次的结束时间开始
+func (g *indexGetter) getAfterLoaded() (storage.Index, error) {
+	res := <-g.indexesFindResponseChan
+	if res.err != nil {
+		g.load(res.request.start)
+		return nil, res.err
+	}
+	g.curResponse = res
+	g.curIndexes, g.indexesBuf = res.indexes, g.curIndexes.Cut(0, 0)
+	g.curTime = res.request.start
+	g.curIndex = 0
+	if g.curIndexes.Len() == 0 {
+		g.eof = true
+		return nil, io.EOF
+	}
+	g.load(g.nextStartTime())
+	return g.getCurIndex(), nil
+}
+
+// get 从指定的开始时间请求并获取索引列表
+func (g *indexGetter) get(startTime int64) (storage.Index, error) {
+	g.load(startTime)
+	if g.nextEOF {
+		g.eof = true
+		return nil, io.EOF
+	}
+	return g.getAfterLoaded()
+}
+
+func (g *indexGetter) Get() (storage.Index, error) {
+	if g.eof {
+		return nil, io.EOF
+	}
+	curTime := g.curTime
+	if g.curResponse == nil {
+		// 第一次请求
+		return g.get(curTime)
+	} else if g.curResponse.request.start == curTime {
+		// curTime 未发生改变
+		if g.curIndexes.Len() > g.curIndex {
+			// curIndexes 中的索引还没获取到结尾
+			return g.getCurIndex(), nil
+		} else {
+			// curIndexes 中的索引已经获取到结尾，需要从下一段索引列表中获取
+			if g.indexesFinding {
+				return g.getAfterLoaded()
+			} else if g.nextEOF {
+				g.eof = true
+				return nil, io.EOF
+			} else {
+				return g.get(g.nextStartTime())
+			}
+		}
+	} else if g.indexesFinding {
+		// curTime 发生改变，并且上一次获取完成后预先请求了下一次可能包含的索引列表
+		return g.getAfterLoadedFrom(curTime)
+	} else {
+		// curTime 发生改变，但上一次获取完成后没有预先请求索引列表
+		return g.get(curTime)
+	}
+}
+
+func (g *indexGetter) Seek(t int64) {
+	g.curTime = t
+	g.curIndex = 0
+	g.eof = false
+}
+
+type readResponse struct {
+	request storage.Index
+	data    []byte
+	err     error
+}
+
+type blockGetter struct {
+	lifecycle.Lifecycle
+
+	storageChannel storage.Channel
+
+	indexGetter *indexGetter
+
+	curBlock     []byte
+	curBlockSeq  uint64
+	nextBlockSeq uint64
+	blockBuf     []byte
+
+	eof         bool
+	getIndexErr error
+	seekFlag    bool
+
+	readSession      storage.ReadSession
+	readRequestChan  chan storage.Index
+	readResponseChan chan *readResponse
+
+	blockReading bool
+}
+
+func newBlockGetter(channel storage.Channel, indexGetter *indexGetter, readSession storage.ReadSession) *blockGetter {
+	getter := &blockGetter{
+		storageChannel: channel,
+		indexGetter:    indexGetter,
+
+		curBlock: make([]byte, channel.MaxBlockSize()),
+		blockBuf: make([]byte, channel.MaxBlockSize()),
+
+		readSession:      readSession,
+		readRequestChan:  make(chan storage.Index, 1),
+		readResponseChan: make(chan *readResponse, 1),
+	}
+	getter.Lifecycle = lifecycle.NewWithInterruptedRun(nil, getter.blockReaderRun)
+	return getter
+}
+
+func (g *blockGetter) blockReaderRun(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	for {
+		select {
+		case index := <-g.readRequestChan:
+			var buf []byte
+			if size := index.DataSize(); size > uint64(cap(g.blockBuf)) {
+				buf = make([]byte, size)
+			} else {
+				buf = g.blockBuf[:size]
+			}
+			n, err := g.readSession.Read(buf, index)
+			if err != nil {
+				g.readResponseChan <- &readResponse{request: index, err: err}
+				continue
+			}
+			g.readResponseChan <- &readResponse{request: index, data: buf[:n]}
+		case <-interrupter:
+			return nil
+		}
+	}
+}
+
+// readNext 获取下一个索引并请求读取对应的 block，如果获取到的索引为当前 block 的索引
+// (由于 seek 改变了位置)，则直接返回当前的 block 并再次获取下一个索引并请求读取对应的
+// block，此时下一个索引一定不与当前 block 的索引相同
+func (g *blockGetter) readNext() (storage.Index, []byte, error) {
+	index, err := g.indexGetter.Get()
+	if err != nil {
+		g.getIndexErr = err
+		g.blockReading = false
+		return nil, nil, err
+	}
+	if g.curBlockSeq == index.Sequence() {
+		// 由于 seek 的原因，获取到的索引与当前 block 的索引一致，提前获取下一个索引
+		// 并请求读取对应的 block
+		g.readNext()
+		return index, g.curBlock, nil
+	}
+	g.getIndexErr = nil
+	g.nextBlockSeq = index.Sequence()
+	g.readRequestChan <- index
+	g.blockReading = true
+	return index, nil, nil
+}
+
+// getAfterRead 从上次请求的响应中获取 block，并预先请求读取下一个索引对应的 block
+func (g *blockGetter) getAfterRead() ([]byte, error) {
+	res := <-g.readResponseChan
+	if res.err != nil {
+		g.readNext()
+		return nil, res.err
+	}
+	g.curBlockSeq = res.request.Sequence()
+	g.curBlock, g.blockBuf = res.data, g.curBlock[:cap(g.curBlock)]
+	g.readNext()
+	return g.curBlock, nil
+}
+
+// getAfterReadFrom 从上次请求的响应中获取 block，判断上次请求的 block 的索引是否是
+// 本次期望的索引，如果是，则直接返回获取到的 block，否则
+func (g *blockGetter) getAfterReadFrom(index storage.Index) ([]byte, error) {
+	res := <-g.readResponseChan
+	if res.err != nil {
+		if res.request.Sequence() == index.Sequence() {
+			g.readNext()
+			return nil, res.err
+		} else {
+			return g.get(index)
+		}
+	}
+	g.curBlockSeq = res.request.Sequence()
+	g.curBlock, g.blockBuf = res.data, g.curBlock[:cap(g.curBlock)]
+	if g.curBlockSeq == index.Sequence() {
+		g.readNext()
+		return g.curBlock, nil
+	}
+	return g.get(index)
+}
+
+func (g *blockGetter) get(index storage.Index) ([]byte, error) {
+	g.readRequestChan <- index
+	g.blockReading = true
+	return g.getAfterRead()
+}
+
+func (g *blockGetter) Get() ([]byte, error) {
+	if g.eof {
+		return nil, io.EOF
+	}
+
+	if g.seekFlag {
+		g.seekFlag = false
+		if index, block, err := g.readNext(); err != nil {
+			// 获取索引时出现错误或读取到末尾
+			if err == io.EOF {
+				return nil, io.EOF
+			}
+			return nil, err
+		} else if block != nil {
+			// 由于 seek 的原因，获取到的索引与当前 block 的索引一致，直接返回
+			return block, nil
+		} else {
+			return g.getAfterReadFrom(index)
+		}
+	} else {
+		if g.blockReading {
+			return g.getAfterRead()
+		} else if g.getIndexErr != nil {
+			// 上一次获取索引时出现错误或读取到末尾
+			if g.getIndexErr == io.EOF {
+				g.eof = true
+				return nil, io.EOF
+			}
+			err := g.getIndexErr
+			g.readNext()
+			return nil, err
+		} else {
+			// 第一次获取 block
+			g.readNext()
+			if g.getIndexErr != nil {
+				// 获取索引时出现错误或读取到末尾
+				if g.getIndexErr == io.EOF {
+					g.eof = true
+					return nil, io.EOF
+				}
+				err := g.getIndexErr
+				g.readNext()
+				return nil, err
+			}
+			return g.getAfterRead()
+		}
+	}
+}
+
+func (g *blockGetter) Seek(t int64) {
+	g.indexGetter.Seek(t)
+	g.seekFlag = true
+	g.eof = false
+}
+
+type HistoryRTPPusher struct {
+	lifecycle.Lifecycle
+	runner *lifecycle.DefaultLifecycle
+
+	id             uint64
+	channel        *Channel
+	storageChannel storage.Channel
+
+	transport  string
+	localIP    net.IP
+	localPort  int
+	remoteIP   net.IP
+	remotePort int
+	ssrc       uint32
+
+	tcpConn *net.TCPConn
+	udpConn *net.UDPConn
+
+	readSession storage.ReadSession
+	indexGetter *indexGetter
+	blockGetter *blockGetter
+
+	startTime int64
+	endTime   int64
+
+	pushSignal   chan struct{}
+	seekSignal   chan int64
+	pauseSignal  chan struct{}
+	resumeSignal chan struct{}
+	scale        atomic.Uint64
+
+	eofCallback HistoryRTPPusherEOFCallback
+
+	log.AtomicLogger
+}
+
+func NewHistoryRTPPusher(id uint64, channel *Channel, remoteIP net.IP, remotePort int, transport string, startTime, endTime int64, ssrc int64,
+	eofCallback HistoryRTPPusherEOFCallback) (*HistoryRTPPusher, error) {
+	storageChannel := channel.loadStorageChannel()
+	if storageChannel == nil {
+		return nil, StorageChannelNotSetupError
+	}
+
+	readSession, err := storageChannel.NewReadSession()
+	if err != nil {
+		return nil, err
+	}
+
+	if ipv4 := remoteIP.To4(); ipv4 != nil {
+		remoteIP = ipv4
+	}
+
+	switch strings.ToLower(transport) {
+	case "tcp":
+		transport = "tcp"
+	default:
+		transport = "udp"
+	}
+
+	var tcpConn *net.TCPConn
+	var udpConn *net.UDPConn
+	var localIp net.IP
+	var localPort int
+	switch transport {
+	case "tcp":
+		conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
+			IP:   remoteIP,
+			Port: remotePort,
+		})
+		if err != nil {
+			readSession.Shutdown()
+			return nil, err
+		}
+		tcpConn = conn
+		localAddr := conn.LocalAddr().(*net.TCPAddr)
+		if ipv4 := localAddr.IP.To4(); ipv4 != nil {
+			localIp = ipv4
+		} else {
+			localIp = localAddr.IP
+		}
+		localPort = localAddr.Port
+	case "udp":
+		conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
+			IP:   remoteIP,
+			Port: remotePort,
+		})
+		if err != nil {
+			readSession.Shutdown()
+			return nil, err
+		}
+		udpConn = conn
+		localAddr := conn.LocalAddr().(*net.UDPAddr)
+		if ipv4 := localAddr.IP.To4(); ipv4 != nil {
+			localIp = ipv4
+		} else {
+			localIp = localAddr.IP
+		}
+		localPort = localAddr.Port
+	}
+
+	p := &HistoryRTPPusher{
+		id:             id,
+		channel:        channel,
+		storageChannel: storageChannel,
+
+		transport:  transport,
+		localIP:    localIp,
+		localPort:  localPort,
+		remoteIP:   remoteIP,
+		remotePort: remotePort,
+		ssrc:       rand.Uint32(),
+
+		tcpConn: tcpConn,
+		udpConn: udpConn,
+
+		readSession: readSession,
+
+		startTime: startTime,
+		endTime:   endTime,
+
+		pushSignal:   make(chan struct{}, 1),
+		seekSignal:   make(chan int64, 1),
+		pauseSignal:  make(chan struct{}, 1),
+		resumeSignal: make(chan struct{}),
+
+		eofCallback: eofCallback,
+	}
+
+	if ssrc < 0 {
+		p.ssrc = rand.Uint32()
+	} else {
+		p.ssrc = uint32(ssrc)
+	}
+
+	p.indexGetter = newIndexGetter(storageChannel, startTime, endTime)
+	p.blockGetter = newBlockGetter(storageChannel, p.indexGetter, readSession)
+
+	p.SetScale(1)
+	p.SetLogger(channel.Logger().Named(p.DisplayName()))
+	p.runner = lifecycle.NewWithInterruptedRun(p.start, p.run)
+	p.Lifecycle = p.runner
+	return p, nil
+}
+
+func (p *HistoryRTPPusher) DisplayName() string {
+	return p.channel.HistoryRTPPlayerDisplayName(p.id)
+}
+
+func (p *HistoryRTPPusher) ID() uint64 {
+	return p.id
+}
+
+func (p *HistoryRTPPusher) LocalIP() net.IP {
+	return p.localIP
+}
+
+func (p *HistoryRTPPusher) LocalPort() int {
+	return p.localPort
+}
+
+func (p *HistoryRTPPusher) RemoteIP() net.IP {
+	return p.remoteIP
+}
+
+func (p *HistoryRTPPusher) RemotePort() int {
+	return p.remotePort
+}
+
+func (p *HistoryRTPPusher) SSRC() uint32 {
+	return p.ssrc
+}
+
+func (p *HistoryRTPPusher) StartTime() int64 {
+	return p.startTime
+}
+
+func (p *HistoryRTPPusher) EndTime() int64 {
+	return p.endTime
+}
+
+func (p *HistoryRTPPusher) Info() map[string]any {
+	return map[string]any{
+		"pusherId":   p.ID(),
+		"localIp":    p.LocalIP(),
+		"localPort":  p.LocalPort(),
+		"remoteIp":   p.RemoteIP(),
+		"remotePort": p.RemotePort(),
+		"ssrc":       p.SSRC(),
+		"startTime":  p.StartTime(),
+		"endTime":    p.EndTime(),
+		"scale":      p.Scale(),
+	}
+}
+
+func (p *HistoryRTPPusher) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	for {
+		select {
+		case <-p.pushSignal:
+			p.readSession.Start()
+			p.indexGetter.Start()
+			p.blockGetter.Start()
+			return nil
+		case <-p.seekSignal:
+		case <-p.pauseSignal:
+		case <-p.resumeSignal:
+		case <-interrupter:
+			err := lifecycle.NewInterruptedError(p.DisplayName(), "启动")
+			p.Logger().Warn(err.Error())
+			return err
+		}
+	}
+}
+
+func (p *HistoryRTPPusher) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	autoEOFCallback := true
+
+	defer func() {
+		if p.tcpConn != nil {
+			p.tcpConn.Close()
+		}
+		if p.udpConn != nil {
+			p.udpConn.Close()
+		}
+		p.blockGetter.Shutdown()
+		p.indexGetter.Shutdown()
+		p.readSession.Shutdown()
+		if autoEOFCallback && p.eofCallback != nil {
+			p.eofCallback(p, p.channel)
+		}
+	}()
+
+	var seq uint16
+	var timestamp, interval time.Duration
+	var writeBuffer = bytes.Buffer{}
+	var readKeepChooser = rtpServer.NewDefaultKeepChooser(5, 5)
+
+	var sendSignal = make(chan struct{}, 1)
+	var sendTimer = timerPkg.NewTimer(sendSignal)
+	defer sendTimer.Stop()
+
+	sendTimer.Trigger()
+seek:
+	for {
+		block, err := p.blockGetter.Get()
+		if err != nil {
+			if err == io.EOF {
+				if p.eofCallback != nil {
+					p.eofCallback(p, p.channel)
+				}
+				p.Logger().Info("播放完成，停止历史音视频推流")
+				autoEOFCallback = false
+				for {
+					select {
+					case t := <-p.seekSignal:
+						p.blockGetter.Seek(t)
+						autoEOFCallback = true
+						continue seek
+					case <-p.pushSignal:
+					case <-p.pauseSignal:
+					case <-p.resumeSignal:
+					case <-interrupter:
+						return nil
+					}
+				}
+			} else if err == storage.ReadSessionClosedError {
+				p.Logger().Warn(err.Error())
+				return nil
+			}
+			// 读取索引或数据错误，连续错误数量达到一定的数量后，关闭推流
+			if !readKeepChooser.OnError(err) {
+				p.Logger().Warn("读取索引或数据错误次数超过限制，关闭推流")
+				return nil
+			}
+			continue
+		}
+		readKeepChooser.OnSuccess()
+
+		frameLayer := framePkg.Layer{}
+		rtpParser := rtp.Parser{Layer: rtp.NewLayer()}
+
+		send := func() error {
+			if p.udpConn != nil {
+				for _, layer := range frameLayer.RTPLayers {
+					layer.WriteTo(&writeBuffer)
+					if _, err := p.udpConn.Write(writeBuffer.Bytes()); err != nil {
+						p.Logger().ErrorWith("发送基于UDP传输的RTP数据失败", err)
+						return err
+					}
+					writeBuffer.Reset()
+				}
+			} else {
+				framePkg.FullLayerWriter{Layer: &frameLayer}.WriteTo(&writeBuffer)
+				if _, err := p.tcpConn.Write(writeBuffer.Bytes()); err != nil {
+					p.Logger().ErrorWith("发送基于TCP传输的RTP数据失败", err)
+					return err
+				}
+				writeBuffer.Reset()
+			}
+			frameLayer.Clear()
+			interval = 3600 * time.Second / time.Duration(90000*p.Scale())
+			timestamp += interval
+			return nil
+		}
+
+		rtpParseKeepChooser := rtpServer.NewDefaultKeepChooser(5, 5)
+
+		for len(block) > 0 {
+			if rtpParser.Layer == nil {
+				rtpParser.Layer = rtp.NewLayer()
+			}
+			ok, remain, err := rtpParser.Parse(block)
+			block = remain
+			if err != nil {
+				p.Logger().ErrorWith("解析RTP数据错误", err)
+				if !rtpParseKeepChooser.OnError(err) {
+					p.Logger().Warn("RTP解析错误次数超过限制，跳过解析此数据块")
+					break
+				}
+				continue
+			}
+			rtpParseKeepChooser.OnSuccess()
+			if ok {
+				layer := rtpParser.Layer
+				rtpParser.Layer = nil
+				layer.SetSequenceNumber(seq)
+				layer.SetSSRC(p.ssrc)
+				seq++
+				if frameLayer.Len() == 0 || layer.Timestamp() == frameLayer.Timestamp {
+					frameLayer.Append(layer)
+				} else {
+					for _, layer := range frameLayer.RTPLayers {
+						layer.SetTimestamp(uint32(timestamp * 90000 / time.Second))
+					}
+				waitSend:
+					for {
+						select {
+						case <-sendSignal:
+							// 到达了此帧应该发送的时刻
+							sendTimer.After(interval)
+							break waitSend
+						case <-p.pushSignal:
+						case t := <-p.seekSignal:
+							// 有 seek 请求，忽略此帧的发送
+							p.blockGetter.Seek(t)
+							continue seek
+						case <-p.pauseSignal:
+							// 有暂停的请求，等待恢复的信号或者 seek 信号
+						waitResume:
+							for {
+								select {
+								case <-p.pushSignal:
+								case <-p.pauseSignal:
+								case <-p.resumeSignal:
+									break waitResume
+								case t := <-p.seekSignal:
+									p.blockGetter.Seek(t)
+									continue seek
+								case <-interrupter:
+									return nil
+								}
+							}
+						case <-p.resumeSignal:
+						case <-interrupter:
+							return nil
+						}
+					}
+					if err := send(); err != nil {
+						// 网络错误，直接关闭推流
+						return err
+					}
+					frameLayer.Append(layer)
+				}
+			}
+		}
+
+		if frameLayer.Len() > 0 {
+			for _, layer := range frameLayer.RTPLayers {
+				layer.SetTimestamp(uint32(timestamp * 90000 / time.Second))
+			}
+			if err := send(); err != nil {
+				// 网络错误，直接关闭推流
+				return err
+			}
+		}
+	}
+}
+
+func (p *HistoryRTPPusher) Push() {
+	if !utils.ChanTryPush(p.pushSignal, struct{}{}) {
+		p.Logger().Warn("开始推流信号繁忙")
+	}
+}
+
+func (p *HistoryRTPPusher) Pause() {
+	if !utils.ChanTryPush(p.pauseSignal, struct{}{}) {
+		p.Logger().Warn("暂停信号繁忙")
+	}
+}
+
+func (p *HistoryRTPPusher) Resume() {
+	if !utils.ChanTryPush(p.resumeSignal, struct{}{}) {
+		p.Logger().Warn("恢复信号繁忙")
+	}
+}
+
+func (p *HistoryRTPPusher) Seek(t int64) error {
+	if t < p.startTime || t > p.endTime {
+		return p.Logger().ErrorMsg("播放时间超过了起始和结束的范围")
+	}
+	if !utils.ChanTryPush(p.seekSignal, t) {
+		p.Logger().Warn("定位信号繁忙")
+	}
+	return nil
+}
+
+func (p *HistoryRTPPusher) Scale() float64 {
+	scaleU := p.scale.Load()
+	return *(*float64)(unsafe.Pointer(&scaleU))
+}
+
+func (p *HistoryRTPPusher) SetScale(scale float64) error {
+	if scale > 8 || scale < 0.5 {
+		return p.Logger().ErrorMsg("播放倍速超过了限制")
+	}
+	p.scale.Store(*(*uint64)(unsafe.Pointer(&scale)))
+	return nil
+}

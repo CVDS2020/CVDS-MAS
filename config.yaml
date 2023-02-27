@@ -1,0 +1,63 @@
+api:
+  host: 0.0.0.0
+  port: 8083
+
+#db:
+#  mysql:
+#    username: root
+#    password: css66018
+#    host: 192.168.1.144
+#    port: 3306
+#    db-name: cvdsdbs
+#    timeout: 2s
+
+#endpoint:
+#  http:
+#    addr: 192.168.1.144:18080
+#    timeout: 2s
+
+gb28181:
+  proxy:
+    id: 44010200492000000001
+    http-url: http://127.0.0.1:8090/gb28181/proxy
+    sip-ip: 192.168.1.129
+    sip-domain: 4401020049
+
+  db:
+    mysql:
+      username: root
+      password: css66018
+      host: 127.0.0.1
+      port: 3306
+      db-name: cvdsdbs
+      timeout: 2s
+
+media:
+  rtp:
+    local-ip: 192.168.1.129
+
+storage:
+  file:
+    directory: data
+    block-size: 4MiB
+    block-duration: 2s
+    file-duration: 60s
+    check-delete-interval: 100ms
+    meta:
+      db:
+        mysql:
+          username: root
+          password: css66018
+          host: 127.0.0.1
+          port: 3306
+          db-name: cvdsrec
+          timeout: 2s
+
+log:
+  level: debug
+  development: true
+  encoding: console
+  #  output-paths: [/Users/suy/Documents/Language/Go/cvds-cmu/log/cvdsmas.log]
+  console-encoder:
+    level-encoder: capital-color
+    disable-function: true

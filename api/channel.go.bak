@@ -1,0 +1,93 @@
+package api
+
+import (
+	"gitee.com/sy_183/common/component"
+	"gitee.com/sy_183/cvds-mas/channel"
+	"github.com/gin-gonic/gin"
+	"net/http"
+)
+
+type Channel struct {
+	manager *channel.Manager
+}
+
+func (c *Channel) CreateChannel(ctx *gin.Context) {
+	channelID, deviceID := ctx.Param("channelId"), ctx.Param("deviceId")
+	if channelID == "" || deviceID == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code": http.StatusBadRequest,
+			"msg":  "empty channel id or device id",
+		})
+		ctx.Abort()
+		return
+	}
+
+	if err := c.manager.CreateChannel(channelID, deviceID); err != nil {
+		ctx.JSON(http.StatusOK, gin.H{
+			"code": http.StatusBadRequest,
+			"msg":  err.Error(),
+		})
+		ctx.Abort()
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"code": http.StatusOK})
+}
+
+func (c *Channel) DeleteChannel(ctx *gin.Context) {
+	channelID, deviceID := ctx.Param("channelId"), ctx.Param("deviceId")
+	if channelID == "" || deviceID == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code": http.StatusBadRequest,
+			"msg":  "empty channel id or device id",
+		})
+		ctx.Abort()
+		return
+	}
+
+	deleted, err := c.manager.DeleteChannel(channelID, deviceID)
+	if err != nil {
+		ctx.JSON(http.StatusOK, gin.H{
+			"code": http.StatusBadRequest,
+			"msg":  err.Error(),
+		})
+		ctx.Abort()
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"code":    http.StatusOK,
+		"deleted": deleted,
+	})
+}
+
+func (c *Channel) ModifyChannel(ctx *gin.Context) {
+	channelID, deviceID := ctx.Param("channelId"), ctx.Param("deviceId")
+	if channelID == "" || deviceID == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"code": http.StatusBadRequest,
+			"msg":  "empty channel id or device id",
+		})
+		ctx.Abort()
+		return
+	}
+
+	modified, err := c.manager.DeleteChannel(channelID, deviceID)
+	if err != nil {
+		ctx.JSON(http.StatusOK, gin.H{
+			"code": http.StatusBadRequest,
+			"msg":  err.Error(),
+		})
+		ctx.Abort()
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"code":     http.StatusOK,
+		"modified": modified,
+	})
+}
+
+var GetChannel = component.NewPointer(func() *Channel {
+	return &Channel{manager: channel.GetManager()}
+}).Get

@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	SysModule     = "api.sys"
+	SysModule     = Module + ".sys"
 	SysModuleName = "系统管理器API服务"
 )
 

@@ -13,15 +13,6 @@ var (
 	StorageChannelNotSetupError = errors.New("存储通道未设置")
 )
 
-type HistoryRTPPusherNotFoundError struct {
-	ChannelID string
-	PusherID  uint64
-}
-
-func (e *HistoryRTPPusherNotFoundError) Error() string {
-	return fmt.Sprintf("通道(%s)历史音视频RTP推流(%d)不存在", e.ChannelID, e.PusherID)
-}
-
 type RTPPlayerNotOpenedError struct {
 	ChannelID string
 }

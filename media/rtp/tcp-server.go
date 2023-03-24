@@ -5,6 +5,7 @@ import (
 	"gitee.com/sy_183/common/component"
 	"gitee.com/sy_183/common/lifecycle"
 	"gitee.com/sy_183/common/log"
+	"gitee.com/sy_183/common/option"
 	"gitee.com/sy_183/common/pool"
 	"gitee.com/sy_183/cvds-mas/config"
 	"gitee.com/sy_183/rtp/rtp"
@@ -12,13 +13,13 @@ import (
 	"net"
 )
 
-const TCPServerModule = "media.rtp.tcp-server"
+const TCPServerModule = Module + ".tcp-server"
 
 var retryableTCPServer = component.Pointer[lifecycle.Retryable[*rtpServer.TCPServer]]{
 	Init: func() *lifecycle.Retryable[*rtpServer.TCPServer] {
 		cfg := config.MediaRTPConfig()
 		// TCP连接通道配置
-		var channelOptions []rtpServer.Option
+		var channelOptions []option.AnyOption
 		if buffer := cfg.Buffer; buffer != 0 {
 			reversed := cfg.BufferReverse
 			if reversed == 0 {
@@ -45,6 +46,8 @@ var retryableTCPServer = component.Pointer[lifecycle.Retryable[*rtpServer.TCPSer
 					bufferCount = 2
 				}
 				poolProvider = pool.StackPoolProvider[*pool.Buffer](bufferCount)
+			default:
+				poolProvider = pool.ProvideSlicePool[*pool.Buffer]
 			}
 			channelOptions = append(channelOptions, rtpServer.WithReadBufferPoolProvider(func() pool.BufferPool {
 				return pool.NewDefaultBufferPool(buffer.Uint(), reversed.Uint(), poolProvider)
@@ -52,9 +55,9 @@ var retryableTCPServer = component.Pointer[lifecycle.Retryable[*rtpServer.TCPSer
 		}
 
 		// TCP服务配置
-		var serverOptions = []rtpServer.Option{
+		var serverOptions = []option.AnyOption{
 			// 配置接受TCP连接的回调
-			rtpServer.WithOnAccept(func(s *rtpServer.TCPServer, conn *net.TCPConn) []rtpServer.Option {
+			rtpServer.WithOnAccept(func(s *rtpServer.TCPServer, conn *net.TCPConn) []option.AnyOption {
 				s.Logger().Info("RTP服务接收到新的TCP连接",
 					log.String("本端地址", conn.LocalAddr().String()),
 					log.String("对端地址", conn.RemoteAddr().String()),
@@ -89,7 +92,9 @@ var retryableTCPServer = component.Pointer[lifecycle.Retryable[*rtpServer.TCPSer
 						channel.Logger().ErrorWith("设置TCP连接是否开启 NO_DELAY 失败", err, log.Bool("是否开启", false))
 					}
 				}
-				channel.OnClose(onClose("TCP通道", channel.Logger())).OnClosed(onClosed("TCP通道", channel.Logger()))
+				const simpleName = "TCP通道"
+				channel.OnClose(defaultOnClose(simpleName, channel)).
+					OnClosed(defaultOnClosed(simpleName, channel))
 			}),
 		}
 		if len(channelOptions) > 0 {
@@ -103,15 +108,16 @@ var retryableTCPServer = component.Pointer[lifecycle.Retryable[*rtpServer.TCPSer
 			Zone: cfg.ListenIPAddr().Zone,
 		}
 		s := rtpServer.NewTCPServer(tcpAddr, serverOptions...)
+		const simpleName = "TCP服务"
 		name := fmt.Sprintf("基于TCP的RTP服务(%s)", tcpAddr.String())
 		config.InitModuleLogger(s, TCPServerModule, name)
 		config.RegisterLoggerConfigReloadedCallback(s, TCPServerModule, name)
 
 		// 配置TCP服务生命周期回调
-		s.OnStarting(onStarting("TCP服务", s.Logger())).
-			OnStarted(onStarted("TCP服务", s.Logger())).
-			OnClose(onClose("TCP服务", s.Logger())).
-			OnClosed(onClosed("TCP服务", s.Logger()))
+		s.OnStarting(defaultOnStarting(simpleName, s)).
+			OnStarted(defaultOnStarted(simpleName, s)).
+			OnClose(defaultOnClose(simpleName, s)).
+			OnClosed(defaultOnClosed(simpleName, s))
 		return lifecycle.NewRetryable(s)
 	},
 }

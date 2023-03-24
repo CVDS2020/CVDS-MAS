@@ -3,18 +3,19 @@ package file
 import (
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/cvds-mas/config"
-	defaultLogger "gitee.com/sy_183/cvds-mas/logger"
+	"gitee.com/sy_183/cvds-mas/storage"
 )
 
-const Module = "storage.file"
+const (
+	Module     = storage.Module + ".file"
+	ModuleName = "文件存储"
+)
 
 var logger log.AtomicLogger
 
 func init() {
-	logger.SetLogger(defaultLogger.Logger())
-	config.Context().RegisterConfigReloadedCallback(func(_, nc *config.Config) {
-		logger.SetLogger(config.LogConfig().MustBuild(Module).WithOptions(log.AddSubName(Module)))
-	})
+	config.InitModuleDefaultLogger(&logger, ModuleName)
+	config.RegisterLoggerConfigReloadedCallback(&logger, Module, ModuleName)
 }
 
 func Logger() *log.Logger {

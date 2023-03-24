@@ -5,46 +5,26 @@ import (
 	"gitee.com/sy_183/common/log"
 )
 
-func onStarting(name string, logger *log.Logger) lifecycle.OnStartingFunc {
+func defaultOnStarting(name string, logger log.LoggerProvider) lifecycle.OnStartingFunc {
 	return func(lifecycle.Lifecycle) {
-		if logger != nil {
-			logger.Info(name + "正在启动")
-		}
+		logOnStarting(name, logger)
 	}
 }
 
-func onStarted(name string, logger *log.Logger) lifecycle.OnStartedFunc {
+func defaultOnStarted(name string, logger log.LoggerProvider) lifecycle.OnStartedFunc {
 	return func(_ lifecycle.Lifecycle, err error) {
-		if logger != nil {
-			if err != nil {
-				logger.ErrorWith(name+"启动失败", err)
-			} else {
-				logger.Info(name + "启动成功")
-			}
-		}
+		logOnStarted(name, logger, err)
 	}
 }
 
-func onClose(name string, logger *log.Logger) lifecycle.OnStartedFunc {
+func defaultOnClose(name string, logger log.LoggerProvider) lifecycle.OnStartedFunc {
 	return func(_ lifecycle.Lifecycle, err error) {
-		if logger != nil {
-			if err != nil {
-				logger.ErrorWith(name+"执行关闭操作失败", err)
-			} else {
-				logger.Info(name + "执行关闭操作成功")
-			}
-		}
+		logOnClose(name, logger, err)
 	}
 }
 
-func onClosed(name string, logger *log.Logger) lifecycle.OnStartedFunc {
+func defaultOnClosed(name string, logger log.LoggerProvider) lifecycle.OnStartedFunc {
 	return func(_ lifecycle.Lifecycle, err error) {
-		if logger != nil {
-			if err != nil {
-				logger.ErrorWith(name+"出现错误并退出", err)
-			} else {
-				logger.Info(name + "已退出")
-			}
-		}
+		logOnClosed(name, logger, err)
 	}
 }

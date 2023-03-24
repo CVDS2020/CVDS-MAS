@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"gitee.com/sy_183/common/errors"
 	"gitee.com/sy_183/common/log"
-	"gitee.com/sy_183/cvds-mas/config"
 	"gorm.io/gorm"
 	gormLogger "gorm.io/gorm/logger"
 	"runtime"
@@ -18,38 +17,28 @@ const (
 	ModuleName = "数据库管理器"
 )
 
-var logger log.AtomicLogger
-
-func init() {
-	config.InitModuleDefaultLogger(&logger, ModuleName)
-	config.RegisterLoggerConfigReloadedCallback(&logger, Module, ModuleName)
-}
-
-func Logger() *log.Logger {
-	return logger.Logger()
-}
-
 type GormLogger struct {
-	base                      *log.Logger
-	sugar                     *log.SugaredLogger
+	logger                    log.LoggerProvider
 	ignoreRecordNotFoundError bool
 	slowThreshold             time.Duration
 }
 
 func (l *GormLogger) LogMode(level gormLogger.LogLevel) gormLogger.Interface {
-	return &GormLogger{base: l.base, sugar: l.sugar}
+	n := new(GormLogger)
+	*n = *l
+	return n
 }
 
 func (l *GormLogger) Info(ctx context.Context, s string, i ...interface{}) {
-	l.sugar.Infof(s, i...)
+	l.logger.Logger().Sugar().Infof(s, i...)
 }
 
 func (l *GormLogger) Warn(ctx context.Context, s string, i ...interface{}) {
-	l.sugar.Warnf(s, i...)
+	l.logger.Logger().Sugar().Warnf(s, i...)
 }
 
 func (l *GormLogger) Error(ctx context.Context, s string, i ...interface{}) {
-	l.sugar.Errorf(s, i...)
+	l.logger.Logger().Sugar().Errorf(s, i...)
 }
 
 func (l *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql string, rowsAffected int64), err error) {
@@ -61,7 +50,7 @@ func (l *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql 
 			break
 		}
 	}
-	logger := l.base.WithOptions(log.AddCallerSkip(skip))
+	logger := l.logger.Logger().WithOptions(log.AddCallerSkip(skip))
 	switch {
 	case err != nil && (!errors.Is(err, gorm.ErrRecordNotFound) || !l.ignoreRecordNotFoundError):
 		sql, rows := fc()
@@ -88,10 +77,9 @@ func (l *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (sql 
 	}
 }
 
-func WrapGormLogger(logger *log.Logger, ignoreRecordNotFoundError bool, slowThreshold time.Duration) gormLogger.Interface {
+func WrapGormLogger(logger log.LoggerProvider, ignoreRecordNotFoundError bool, slowThreshold time.Duration) gormLogger.Interface {
 	return &GormLogger{
-		base:                      logger,
-		sugar:                     logger.Sugar(),
+		logger:                    logger,
 		ignoreRecordNotFoundError: ignoreRecordNotFoundError,
 		slowThreshold:             slowThreshold,
 	}

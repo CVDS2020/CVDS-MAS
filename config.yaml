@@ -2,21 +2,8 @@ api:
   host: 0.0.0.0
   port: 8083
 
-#db:
-#  mysql:
-#    username: root
-#    password: css66018
-#    host: 192.168.1.144
-#    port: 3306
-#    db-name: cvdsdbs
-#    timeout: 2s
-
-#endpoint:
-#  http:
-#    addr: 192.168.1.144:18080
-#    timeout: 2s
-
 gb28181:
+  enable: false
   proxy:
     id: 44010200492000000001
     http-url: http://127.0.0.1:8090/gb28181/proxy
@@ -32,16 +19,35 @@ gb28181:
       db-name: cvdsdbs
       timeout: 2s
 
+zongheng:
+  enable: true
+  endpoint:
+    addr: 192.168.1.144:18080
+
+  db:
+    mysql:
+      username: root
+      password: css66018
+      host: 192.168.1.144
+      port: 3306
+      db-name: cvdsdbs
+      timeout: 2s
+
+  sync-interval: 5s
+
 media:
   rtp:
     local-ip: 192.168.1.129
+    buffer: 256KiB
+    buffer-pool-type: slice
+    buffer-count: 8
 
 storage:
   file:
     directory: data
-    block-size: 4MiB
-    block-duration: 2s
-    file-duration: 60s
+#    block-size: 4MiB
+#    block-duration: 2s
+    file-duration: 10m
     check-delete-interval: 100ms
     meta:
       db:
@@ -54,10 +60,18 @@ storage:
           timeout: 2s
 
 log:
-  level: debug
+  level: info
   development: true
   encoding: console
   #  output-paths: [/Users/suy/Documents/Language/Go/cvds-cmu/log/cvdsmas.log]
   console-encoder:
     level-encoder: capital-color
     disable-function: true
+
+  db-manager:
+    level: info
+
+#  modules:
+#    gb28181.db: db-manager
+#    zongheng.db: db-manager
+#    storage.file.db: db-manager

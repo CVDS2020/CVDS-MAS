@@ -3,22 +3,22 @@ package storage
 import (
 	"gitee.com/sy_183/common/lifecycle"
 	"gitee.com/sy_183/common/log"
-	"gitee.com/sy_183/common/unit"
+	"io"
 	"time"
 )
 
 type Channel interface {
 	lifecycle.Lifecycle
 
+	Name() string
+
+	DisplayName() string
+
 	Cover() time.Duration
 
 	SetCover(cover time.Duration) Channel
 
-	BlockSize() unit.Size
-
-	KeyFrameBlockSize() unit.Size
-
-	MaxBlockSize() unit.Size
+	WriteBufferSize() uint
 
 	MakeIndexes(cap int) Indexes
 
@@ -26,9 +26,11 @@ type Channel interface {
 
 	NewReadSession() (ReadSession, error)
 
-	Write(frame Frame) bool
+	Write(writer io.WriterTo, size uint, start, end time.Time, storageType uint32, sync bool) error
 
-	Sync()
+	WriteStreamLost(start, end time.Time) error
+
+	Sync() error
 
 	log.LoggerProvider
 }

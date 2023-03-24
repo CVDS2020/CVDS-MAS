@@ -9,6 +9,7 @@ import (
 	"gitee.com/sy_183/cvds-mas/gb28181"
 	mediaChannel "gitee.com/sy_183/cvds-mas/media/channel"
 	"gitee.com/sy_183/cvds-mas/media/rtp"
+	"gitee.com/sy_183/cvds-mas/zongheng"
 	rtpServer "gitee.com/sy_183/rtp/server"
 )
 
@@ -20,6 +21,9 @@ type App struct {
 	gb28181ChannelManager       *gb28181.ChannelManager
 	gb28181StorageConfigManager *gb28181.StorageConfigManager
 
+	zongHengDBManager      *db.DBManager
+	zongHengChannelManager *zongheng.ChannelManager
+
 	apiServer           *api.Server
 	mediaChannelManager *mediaChannel.Manager
 	rtpTCPServer        *lifecycle.Retryable[*rtpServer.TCPServer]
@@ -28,32 +32,50 @@ type App struct {
 
 func newApp() *App {
 	app := &App{
-		gb28181DBManager:            gb28181.GetDBManager(),
-		gb28181ChannelManager:       gb28181.GetChannelManager(),
-		gb28181StorageConfigManager: gb28181.GetStorageConfigManager(),
-
 		apiServer:           api.GetServer(),
 		mediaChannelManager: mediaChannel.GetManager(),
 		rtpTCPServer:        rtp.GetRetryableTCPServer(),
 		rtpManager:          rtp.GetManager(),
 	}
 
-	app.list = lifecycle.NewList().
+	if app.apiServer.GB28181() != nil {
+		app.gb28181DBManager = gb28181.GetDBManager()
+		app.gb28181ChannelManager = gb28181.GetChannelManager()
+		app.gb28181StorageConfigManager = gb28181.GetStorageConfigManager()
+	}
+
+	if app.apiServer.ZongHeng() != nil {
+		app.zongHengDBManager = zongheng.GetDBManager()
+		app.zongHengChannelManager = zongheng.GetChannelManager()
+	}
+
+	group1 := lifecycle.NewGroup().MustAdd("media.rtp", lifecycle.NewList().
 		MustAppend(lifecycle.NewGroup().
-			MustAdd(gb28181.DBManagerModule, app.gb28181DBManager).SetCloseAllOnExit(false).Group().
-			MustAdd("media.rtp", lifecycle.NewList().
-				MustAppend(lifecycle.NewGroup().
-					MustAdd(rtp.ManagerModule, app.rtpManager).Group().
-					MustAdd(rtp.TCPServerModule, app.rtpTCPServer).Group(),
-				).List().
-				MustAppend(app.mediaChannelManager).List(),
-			).Group(),
+			MustAdd(rtp.ManagerModule, app.rtpManager).Group().
+			MustAdd(rtp.TCPServerModule, app.rtpTCPServer).Group(),
 		).List().
-		MustAppend(lifecycle.NewGroup().
+		MustAppend(app.mediaChannelManager).List(),
+	).Group()
+
+	if app.gb28181DBManager != nil {
+		group1.MustAdd(gb28181.DBManagerModule, app.gb28181DBManager).SetCloseAllOnExit(false)
+	}
+	if app.zongHengDBManager != nil {
+		group1.MustAdd(zongheng.DBManagerModule, app.zongHengDBManager).SetCloseAllOnExit(false)
+	}
+
+	app.list = lifecycle.NewList().MustAppend(group1).List()
+
+	if app.gb28181ChannelManager != nil && app.gb28181StorageConfigManager != nil {
+		app.list.MustAppend(lifecycle.NewGroup().
 			MustAdd(gb28181.ChannelManagerModule, app.gb28181ChannelManager).Group().
 			MustAdd(gb28181.StorageConfigManagerModule, app.gb28181StorageConfigManager).Group(),
-		).List().
-		MustAppend(app.apiServer).List()
+		)
+	}
+	if app.zongHengChannelManager != nil {
+		app.list.MustAppend(app.zongHengChannelManager)
+	}
+	app.list.MustAppend(app.apiServer).List()
 
 	app.Lifecycle = lifecycle.NewWithInterruptedRun(app.start, app.run)
 	return app
@@ -65,10 +87,11 @@ func (a *App) handleStopSignal() error {
 }
 
 func (a *App) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	listWaiter := a.list.StartedWaiter()
 	a.list.Background()
 	for {
 		select {
-		case err := <-a.list.StartedWaiter():
+		case err := <-listWaiter:
 			if err != nil {
 				return err
 			}
@@ -108,9 +131,10 @@ func (a *App) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
 			config.Context().ReloadConfig()
 
 			// 启动所有组件
+			listWaiter := a.list.StartedWaiter()
 			a.list.Background()
 			select {
-			case err := <-a.list.StartedWaiter():
+			case err := <-listWaiter:
 				if err != nil {
 					return err
 				}

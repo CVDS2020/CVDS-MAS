@@ -5,6 +5,7 @@ import (
 	"gitee.com/sy_183/common/component"
 	"gitee.com/sy_183/common/lifecycle"
 	"gitee.com/sy_183/common/log"
+	"gitee.com/sy_183/common/option"
 	"gitee.com/sy_183/common/pool"
 	"gitee.com/sy_183/cvds-mas/config"
 	"gitee.com/sy_183/rtp/rtp"
@@ -13,16 +14,16 @@ import (
 )
 
 const (
-	ManagerModule     = "media.rtp.manager"
+	ManagerModule     = Module + ".manager"
 	ManagerModuleName = "RTP服务管理器"
-	UDPServerModule   = "media.rtp.udp-server"
+	UDPServerModule   = Module + ".udp-server"
 )
 
 var manager = component.Pointer[rtpServer.Manager]{
 	Init: func() *rtpServer.Manager {
 		// UDP服务配置
 		cfg := config.MediaRTPConfig()
-		var serverOptions []rtpServer.Option
+		var serverOptions []option.AnyOption
 		if buffer := cfg.Buffer; buffer != 0 {
 			reversed := cfg.BufferReverse
 			if reversed == 0 {
@@ -49,6 +50,8 @@ var manager = component.Pointer[rtpServer.Manager]{
 					bufferCount = 2
 				}
 				poolProvider = pool.StackPoolProvider[*pool.Buffer](bufferCount)
+			default:
+				poolProvider = pool.ProvideSlicePool[*pool.Buffer]
 			}
 			serverOptions = append(serverOptions, rtpServer.WithReadBufferPoolProvider(func() pool.BufferPool {
 				return pool.NewDefaultBufferPool(buffer.Uint(), reversed.Uint(), poolProvider)
@@ -71,7 +74,7 @@ var manager = component.Pointer[rtpServer.Manager]{
 		}
 
 		// 创建UDP服务管理器
-		manager := rtpServer.NewManager(cfg.ListenIPAddr(), func(m *rtpServer.Manager, port uint16, options ...rtpServer.Option) rtpServer.Server {
+		manager := rtpServer.NewManager(cfg.ListenIPAddr(), func(m *rtpServer.Manager, port uint16, options ...option.AnyOption) rtpServer.Server {
 			// 创建UDP服务
 			ipAddr := m.Addr()
 			udpAddr := &net.UDPAddr{
@@ -80,26 +83,37 @@ var manager = component.Pointer[rtpServer.Manager]{
 				Zone: ipAddr.Zone,
 			}
 			s := rtpServer.NewUDPServer(udpAddr, options...)
-			config.InitModuleLogger(s, UDPServerModule, fmt.Sprintf("基于UDP的RTP服务(%s)", udpAddr.String()))
 
+			const (
+				loggerConfigReloadedCallbackId = "loggerConfigReloadedCallbackId"
+				simpleName                     = "UDP服务"
+			)
+			name := fmt.Sprintf("基于UDP的RTP服务(%s)", udpAddr.String())
 			// 配置UDP服务生命周期回调
-			s.OnStarting(onStarting("UDP服务", s.Logger())).
-				OnStarted(func(lifecycle lifecycle.Lifecycle, err error) {
-					listener := s.Listener()
-					if cfg.Socket.ReadBuffer != 0 {
-						if err := listener.SetReadBuffer(cfg.Socket.ReadBuffer); err != nil {
-							s.Logger().ErrorWith("设置 SOCKET 读缓冲区失败", err, log.Int("缓冲区大小", cfg.Socket.ReadBuffer))
-						}
+			s.OnStarting(func(lifecycle.Lifecycle) {
+				config.InitModuleLogger(s, UDPServerModule, name)
+				s.SetField(loggerConfigReloadedCallbackId, config.RegisterLoggerConfigReloadedCallback(s, UDPServerModule, name))
+				logOnStarting(simpleName, s)
+			})
+			s.OnStarted(func(lifecycle lifecycle.Lifecycle, err error) {
+				listener := s.Listener()
+				if cfg.Socket.ReadBuffer != 0 {
+					if err := listener.SetReadBuffer(cfg.Socket.ReadBuffer); err != nil {
+						s.Logger().ErrorWith("设置 SOCKET 读缓冲区失败", err, log.Int("缓冲区大小", cfg.Socket.ReadBuffer))
 					}
-					if cfg.Socket.WriteBuffer != 0 {
-						if err := listener.SetWriteBuffer(cfg.Socket.WriteBuffer); err != nil {
-							s.Logger().ErrorWith("设置 SOCKET 写缓冲区失败", err, log.Int("缓冲区大小", cfg.Socket.WriteBuffer))
-						}
+				}
+				if cfg.Socket.WriteBuffer != 0 {
+					if err := listener.SetWriteBuffer(cfg.Socket.WriteBuffer); err != nil {
+						s.Logger().ErrorWith("设置 SOCKET 写缓冲区失败", err, log.Int("缓冲区大小", cfg.Socket.WriteBuffer))
 					}
-					onStarted("UDP服务", s.Logger())(lifecycle, err)
-				}).
-				OnClose(onClose("UDP服务", s.Logger())).
-				OnClosed(onClosed("UDP服务", s.Logger()))
+				}
+				logOnStarted(simpleName, s, err)
+			})
+			s.OnClose(defaultOnClose(simpleName, s))
+			s.OnClosed(func(_ lifecycle.Lifecycle, err error) {
+				logOnClosed(simpleName, s, err)
+				config.UnregisterLoggerConfigReloadedCallback(s.Field(loggerConfigReloadedCallbackId).(uint64))
+			})
 			return s
 		}, managerOptions...)
 		config.InitModuleLogger(manager, ManagerModule, ManagerModuleName)

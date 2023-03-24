@@ -6,65 +6,52 @@ import (
 	"gitee.com/sy_183/common/pool"
 	"gitee.com/sy_183/common/unit"
 	"gitee.com/sy_183/cvds-mas/config"
+	dbPkg "gitee.com/sy_183/cvds-mas/db"
 	"gitee.com/sy_183/cvds-mas/storage"
-	filePkg "gitee.com/sy_183/cvds-mas/storage/file"
+	fileStorage "gitee.com/sy_183/cvds-mas/storage/file"
+	"gitee.com/sy_183/cvds-mas/storage/meta"
 	"io"
 	"time"
 )
 
-type TestFrame struct {
-	*pool.Data
-	Start time.Time
-	End   time.Time
+const DefaultTimeLayout = "2006-01-02 15:04:05.999999999"
+
+var logger = assert.Must(log.Config{
+	Level: log.NewAtomicLevelAt(log.InfoLevel),
+	Encoder: log.NewConsoleEncoder(log.ConsoleEncoderConfig{
+		DisableCaller:     true,
+		DisableFunction:   true,
+		DisableStacktrace: true,
+		EncodeLevel:       log.CapitalColorLevelEncoder,
+		EncodeTime:        log.TimeEncoderOfLayout(DefaultTimeLayout),
+		EncodeDuration:    log.SecondsDurationEncoder,
+	}),
+}.Build())
+
+var dbLogger = assert.Must(log.Config{
+	Level: log.NewAtomicLevelAt(log.ErrorLevel),
+	Encoder: log.NewConsoleEncoder(log.ConsoleEncoderConfig{
+		DisableCaller:     true,
+		DisableFunction:   true,
+		DisableStacktrace: true,
+		EncodeLevel:       log.CapitalColorLevelEncoder,
+		EncodeTime:        log.TimeEncoderOfLayout(DefaultTimeLayout),
+		EncodeDuration:    log.SecondsDurationEncoder,
+	}),
+}.Build())
+
+type Block struct {
+	raw []byte
 }
 
-func (f *TestFrame) WriteTo(w io.Writer) (n int64, err error) {
-	_n, err := w.Write(f.Data.Data)
+func (f Block) WriteTo(w io.Writer) (n int64, err error) {
+	_n, err := w.Write(f.raw)
 	return int64(_n), err
-}
-
-func (f *TestFrame) Size() uint {
-	return f.Data.Len()
-}
-
-func (f *TestFrame) StartTime() time.Time {
-	return f.Start
-}
-
-func (f *TestFrame) EndTime() time.Time {
-	return f.End
-}
-
-func (f *TestFrame) KeyFrame() bool {
-	return false
-}
-
-func (f *TestFrame) MediaType() uint32 {
-	return 96
-}
-
-func (f *TestFrame) StorageType() uint32 {
-	return 96
 }
 
 func parseTime(value string) time.Time {
 	return assert.Must(time.Parse("2006-01-02 15:04:05", value)).In(time.Local)
 }
-
-const DefaultTimeLayout = "2006-01-02 15:04:05.999999999"
-
-var logger = assert.Must(log.Config{
-	Level: log.NewAtomicLevelAt(log.DebugLevel),
-	Encoder: log.NewConsoleEncoder(log.ConsoleEncoderConfig{
-		DisableCaller:     true,
-		DisableFunction:   true,
-		DisableStacktrace: true,
-		EncodeLevel:       log.CapitalLevelEncoder,
-		EncodeTime:        log.TimeEncoderOfLayout(DefaultTimeLayout),
-		EncodeDuration:    log.SecondsDurationEncoder,
-	}),
-	//OutputPaths: []string{"test.log"},
-}.Build())
 
 func main() {
 	mysqlConfig := &config.Mysql{
@@ -74,27 +61,28 @@ func main() {
 		Port:     3306,
 		DBName:   "cvdsrec",
 	}
-	ch := filePkg.NewChannel("test",
-		filePkg.WithDirectory("C:\\Users\\suy\\Documents\\Language\\Go\\cvds-cmu\\data"),
-		filePkg.WithCover(time.Minute),
-		filePkg.WithFileSize(unit.MeBiByte*10),
-		filePkg.WithCheckDeleteInterval(time.Millisecond*300),
-		storage.WithChannelLogger(logger),
-		filePkg.WithDBMetaManager(
-			filePkg.WithDBMetaManagerDSN(mysqlConfig.DSN()),
-		),
+	ch := fileStorage.NewChannel("test",
+		fileStorage.WithDirectory("C:\\Users\\suy\\Documents\\Language\\Go\\cvds-mas\\data"),
+		storage.WithCover(time.Minute),
+		fileStorage.WithFileSize(unit.MeBiByte*10),
+		fileStorage.WithCheckDeleteInterval(time.Millisecond*20),
+		storage.WithLogger(logger),
+		fileStorage.WithMetaManagerConfig(meta.ProvideDBMetaManager, meta.WithDBManager(dbPkg.NewDBManager(nil, mysqlConfig.DSN(), dbPkg.WithTablesInfo(meta.MetaTablesInfos)))),
+		fileStorage.WithWriteBufferPoolConfig(3*unit.MeBiByte, pool.StackPoolProvider[*fileStorage.Buffer](2)),
 	)
-	buf := make([]byte, 65536)
+	buf := make([]byte, unit.MeBiByte)
+	ch.MetaManager().(*meta.DBMetaManager).DBManager().SetLogger(dbLogger)
 	ch.Start()
-	now := parseTime("2022-12-08 22:00:00")
-	for i := 0; i < 1000; i++ {
-		ch.Write(&TestFrame{
-			Data:  pool.NewData(buf),
-			Start: now,
-			End:   now.Add(time.Millisecond * 30),
-		})
+	for i := 0; i < 10000; i++ {
+		start := time.Now()
 		time.Sleep(time.Millisecond * 30)
-		now = now.Add(time.Millisecond * 50)
+		end := time.Now()
+		//if rand.Float64() > 0.3 {
+		ch.Write(Block{buf}, uint(len(buf)), start, end, storage.StorageTypeRTP.ID, false)
+		//} else {
+		//ch.WriteStreamLost(start, end)
+		//}
 	}
+	ch.CloseFile()
 	<-ch.ClosedWaiter()
 }

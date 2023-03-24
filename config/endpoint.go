@@ -1,6 +1,8 @@
 package config
 
+import "time"
+
 type Endpoint struct {
-	Type string       `yaml:"type" json:"type" default:"http"`
-	Http EndpointHttp `yaml:"http" json:"http"`
+	Addr    string        `yaml:"addr" json:"addr" default:"localhost:18080"`
+	Timeout time.Duration `yaml:"timeout" json:"timeout"`
 }

@@ -1,165 +1,267 @@
 package file
 
 import (
+	"errors"
 	"fmt"
+	"gitee.com/sy_183/common/container"
 	"gitee.com/sy_183/common/def"
-	"gitee.com/sy_183/common/errors"
 	"gitee.com/sy_183/common/flag"
 	"gitee.com/sy_183/common/lifecycle"
+	"gitee.com/sy_183/common/lifecycle/retry"
 	taskPkg "gitee.com/sy_183/common/lifecycle/task"
 	"gitee.com/sy_183/common/lock"
 	"gitee.com/sy_183/common/log"
+	"gitee.com/sy_183/common/pool"
 	"gitee.com/sy_183/common/unit"
+	"gitee.com/sy_183/cvds-mas/config"
 	"gitee.com/sy_183/cvds-mas/storage"
 	"gitee.com/sy_183/cvds-mas/storage/file/context"
+	"gitee.com/sy_183/cvds-mas/storage/meta"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-var ChannelNotAvailableError = errors.New("存储通道不可用")
+const ChannelModule = Module + ".channel"
 
-type FileNameFormatter func(c *Channel, seq uint64, createTime time.Time, mediaType uint32, storageType uint32) string
+const (
+	// 默认覆盖周期为7天
+	DefaultCover = 7 * 24 * time.Hour
+	// 最小覆盖周期为1分钟
+	MinCover = time.Minute
+
+	// 文件大小默认512M
+	DefaultFileSize = 512 * unit.MeBiByte
+	// 文件大小最小为1M
+	MinFileSize = unit.MeBiByte
+
+	// 默认文件持续时间为30分钟
+	DefaultFileDuration = 30 * time.Minute
+	// 最小文件持续时间为1分钟
+	MinFileDuration = time.Minute
+
+	// 默认检查过期索引是否要删除的间隔时间为1s
+	DefaultCheckDeleteInterval = time.Second
+	// 最小检查过期索引是否要删除的间隔时间为10ms
+	MinCheckDeleteInterval = 10 * time.Millisecond
+
+	DefaultWriteBufferSize  = unit.MeBiByte
+	DefaultWriteBufferCount = 2
+
+	// 默认最大同步请求个数为128
+	DefaultMaxSyncReqs = 128
+	// 最小支持最大同步请求个数为2
+	MinMaxSyncReqs = 2
+
+	// 默认最大删除任务个数为16
+	DefaultMaxDeletingFiles = 16
+	// 最小支持最大删除任务个数为1
+	MinMaxDeletingFiles = 1
+)
+
+var ChannelNotAvailableError = errors.New("存储通道不可用")
 
 type Channel struct {
 	lifecycle.Lifecycle
 	runner *lifecycle.DefaultLifecycle
 
-	name      string
+	// 存储通道名称
+	name string
+	// 存储文件夹路径
 	directory atomic.Pointer[string]
-	cover     atomic.Int64
+	// 存储覆盖周期
+	cover atomic.Int64
 
-	blockSize         unit.Size
-	keyFrameBlockSize unit.Size
-	maxBlockSize      unit.Size
+	// 文件上下文，负责文件的写入
+	fileCtx    *context.Context
+	switchFile bool
+	// 基于数据库的元数据管理器，负责元数据(包括文件信息，索引信息)的增删改查
+	metaManager meta.Manager
 
-	blockDuration    time.Duration
-	maxBlockDuration time.Duration
+	// 单个文件大小，超过此大小后将写入到下一个文件中
+	fileSize unit.Size
+	// 单个文件持续时间，超过此持续时间后将写入到下一个文件中
+	fileDuration time.Duration
+	// 文件命名格式
+	fileNameFormatter atomic.Pointer[storage.FileNameFormatter]
 
-	fileSize          unit.Size
-	fileDuration      time.Duration
-	fileNameFormatter atomic.Value
-
-	maxDeletingFiles    int
+	// 检查索引是否可以被删除的间隔时间
 	checkDeleteInterval time.Duration
 
-	writeBuffer []byte
-
-	block                *Block
-	writingBlock         atomic.Pointer[Block]
-	droppedBlock         *DroppedBlock
-	lastBlockMediaType   uint32
-	lastBlockStorageType uint32
-
-	ctx       *context.Context
-	newCtx    *context.Context
-	switchCtx atomic.Pointer[context.Context]
-
-	fileTaskList       *taskPkg.TaskExecutor
-	fileDeleteTaskList *taskPkg.TaskExecutor
-	writer             *taskPkg.TaskExecutor
-	deleter            lifecycle.Lifecycle
-	metaManager        *dbMetaManager
-
-	readSessions sync.Map
-
+	// 写缓冲区大小，如果写入后的大小超过此大小，则在写入前先执行同步到磁盘
+	writeBufferSize uint
+	// 写入缓冲区池，用于申请写入缓冲区，如果缓冲区申请失败，则丢弃当前正在写入的数据，并生成数据被丢弃的索引
+	writeBufferPool pool.Pool[*Buffer]
+	// 此互斥锁用于同步写入数据、写入流丢失信息和执行同步这三个接口
 	writeLock sync.Mutex
+
+	syncReq      syncRequest
+	syncReqs     *container.Queue[syncRequest]
+	syncReqsLock sync.Mutex
+
+	// 需要被删除的文件信息队列，删除任务从队列中获取这些文件信息，并删除对应的文件及文件信息
+	deleteFiles     *container.Queue[*meta.File]
+	deleteFilesLock sync.Mutex
+
+	// 同步任务执行器，顺序执行同步任务
+	syncTaskExecutor *taskPkg.TaskExecutor
+	// 删除文件任务执行器，顺序执行文件删除任务
+	deleteTaskExecutor *taskPkg.TaskExecutor
+
+	readSessions container.SyncMap[*ReadSession, struct{}]
 
 	log.AtomicLogger
 }
 
-func NewChannel(name string, options ...storage.ChannelOption) *Channel {
+func NewChannel(name string, options ...storage.Option) *Channel {
 	c := &Channel{
-		name:         name,
-		fileTaskList: taskPkg.NewTaskExecutor(1),
-		writer:       taskPkg.NewTaskExecutor(1),
+		name:               name,
+		syncTaskExecutor:   taskPkg.NewTaskExecutor(1),
+		deleteTaskExecutor: taskPkg.NewTaskExecutor(1),
 	}
-	c.deleter = lifecycle.NewWithInterruptedRun(nil, c.deleterRun)
-	var dbMetaManagerOpts dbMetaManagerOptions
+	var metaManagerConfigOpt metaManagerConfig
 	for _, option := range options {
 		switch opt := option.Apply(c).(type) {
-		case dbMetaManagerOptions:
-			dbMetaManagerOpts = opt
+		case metaManagerConfig:
+			metaManagerConfigOpt = opt
 		}
 	}
 
-	c.cover.CompareAndSwap(0, int64(time.Hour*24*7))
-	if cover := c.cover.Load(); time.Duration(cover) < time.Minute {
-		c.cover.Store(int64(time.Minute))
+	c.cover.CompareAndSwap(0, int64(DefaultCover))
+	if cover := c.cover.Load(); time.Duration(cover) < MinCover {
+		c.cover.Store(int64(MinCover))
 	}
 
-	// 数据块默认大小1M
-	c.blockSize = def.SetDefault(c.blockSize, unit.MeBiByte)
-	if c.blockSize < 64*unit.KiBiByte {
-		// 数据块最小64K
-		c.blockSize = 64 * unit.KiBiByte
-	}
-	if c.keyFrameBlockSize < c.blockSize {
-		c.keyFrameBlockSize = c.blockSize
-	}
-	if c.maxBlockSize < c.keyFrameBlockSize {
-		c.maxBlockSize = c.keyFrameBlockSize
-	}
-	// 数据块默认持续时间为5s
-	c.blockDuration = def.SetDefault(c.blockDuration, time.Second*5)
-	if c.blockDuration < time.Millisecond*100 {
-		// 数据块最小持续时间为100ms
-		c.blockDuration = 100 * time.Millisecond
-	}
-	if c.maxBlockDuration < c.blockDuration {
-		c.maxBlockDuration = c.blockDuration
+	c.fileSize = def.SetDefault(c.fileSize, DefaultFileSize)
+	if c.fileSize < MinFileSize {
+		c.fileSize = MinFileSize
 	}
 
-	// 文件大小默认512M
-	c.fileSize = def.SetDefault(c.fileSize, 512*unit.MeBiByte)
-	if c.fileSize < unit.MeBiByte {
-		// 文件大小最小为1M
-		c.fileSize = unit.MeBiByte
-	}
-	// 文件默认持续时间为30分钟
-	c.fileDuration = def.SetDefault(c.fileDuration, 30*time.Minute)
-	if c.fileDuration < time.Minute {
-		// 文件最小持续时间为1分钟
-		c.fileDuration = time.Minute
+	c.fileDuration = def.SetDefault(c.fileDuration, DefaultFileDuration)
+	if c.fileDuration < MinFileDuration {
+		c.fileDuration = MinFileDuration
 	}
 
-	// 默认最大同时删除的文件为16个
-	c.maxDeletingFiles = def.SetDefault(c.maxDeletingFiles, 16)
-	if c.maxDeletingFiles < 1 {
-		// 最大同时删除的文件个数的最小值为1个
-		c.maxDeletingFiles = 1
-	}
-	// 默认检查过期索引是否要删除的间隔时间为1s
-	c.checkDeleteInterval = def.SetDefault(c.checkDeleteInterval, time.Second)
-	if c.checkDeleteInterval < 50*time.Millisecond {
-		// 最小检查过期索引是否要删除的间隔时间为50ms
-		c.checkDeleteInterval = 50 * time.Millisecond
+	if c.FileNameFormatter() == nil {
+		c.SetFileNameFormatter(storage.DefaultFileNameFormatter)
 	}
 
-	c.writeBuffer = make([]byte, c.maxBlockSize)
-	c.fileDeleteTaskList = taskPkg.NewTaskExecutor(c.maxDeletingFiles)
+	c.checkDeleteInterval = def.SetDefault(c.checkDeleteInterval, DefaultCheckDeleteInterval)
+	if c.checkDeleteInterval < MinCheckDeleteInterval {
+		c.checkDeleteInterval = MinCheckDeleteInterval
+	}
 
-	if !c.CompareAndSwapLogger(nil, Logger().Named(c.DisplayName())) {
+	if c.writeBufferPool == nil {
+		c.writeBufferSize = DefaultWriteBufferSize
+		c.writeBufferPool = pool.NewStackPool(func(p *pool.StackPool[*Buffer]) *Buffer {
+			return NewBuffer(c.writeBufferSize)
+		}, DefaultWriteBufferCount)
+	}
+
+	if c.syncReqs == nil {
+		c.syncReqs = container.NewQueue[syncRequest](DefaultMaxSyncReqs)
+	}
+
+	if c.deleteFiles == nil {
+		c.deleteFiles = container.NewQueue[*meta.File](DefaultMaxDeletingFiles)
+	}
+
+	if !c.CompareAndSwapLogger(nil, config.DefaultLogger().Named(c.DisplayName())) {
 		c.SetLogger(c.Logger().Named(c.DisplayName()))
 	}
-	c.fileNameFormatter.CompareAndSwap(nil, FileNameFormatter(func(c *Channel, seq uint64, createTime time.Time, mediaType uint32, storageType uint32) string {
-		var suffix string
-		if typ := storage.GetStorageType(storageType); typ != nil {
-			suffix = "." + typ.Suffix
-		}
-		return fmt.Sprintf("%s-%s-%d%s", c.Name(), createTime.Format("20060102150405"), seq, suffix)
-	}))
 
-	if dbMetaManagerOpts != nil {
-		c.metaManager = NewDBMetaManager(c, dbMetaManagerOpts...)
+	if metaManagerConfigOpt.provider != nil {
+		c.metaManager = metaManagerConfigOpt.build(c)
 	} else {
-		c.metaManager = NewDBMetaManager(c)
+		c.metaManager = meta.NewDBMetaManager(c)
 	}
 
-	c.runner = lifecycle.NewWithInterruptedRun(c.start, c.run)
+	c.runner = lifecycle.NewWithInterruptedRun(c.start, c.run, lifecycle.WithSelf(c))
 	c.Lifecycle = c.runner
 	return c
+}
+
+type Buffer struct {
+	raw []byte
+	cur uint
+}
+
+func NewBuffer(size uint) *Buffer {
+	return &Buffer{raw: make([]byte, size)}
+}
+
+func (b *Buffer) Reset() {
+	b.cur = 0
+}
+
+func (b *Buffer) Bytes() []byte {
+	return b.raw[:b.cur]
+}
+
+func (b *Buffer) Remain() uint {
+	return uint(len(b.raw)) - b.cur
+}
+
+func (b *Buffer) Write(p []byte) (n int, err error) {
+	n = copy(b.raw[b.cur:], p)
+	b.cur += uint(n)
+	return
+}
+
+type syncRequest interface {
+	synchronizing() bool
+	setSynchronizing()
+}
+
+type abstractSyncRequest struct {
+	_synchronizing bool
+}
+
+func (r *abstractSyncRequest) synchronizing() bool {
+	return r._synchronizing
+}
+
+func (r *abstractSyncRequest) setSynchronizing() {
+	r._synchronizing = true
+}
+
+type blockRequest struct {
+	buffer  *Buffer
+	index   storage.Index
+	indexes []storage.Index
+	abstractSyncRequest
+}
+
+func (b *blockRequest) addIndex(index storage.Index) {
+	if b.index == nil {
+		b.index = index
+	} else {
+		b.indexes = append(b.indexes, index)
+	}
+}
+
+func (b *blockRequest) rangeIndex(f func(index storage.Index) bool) {
+	if b.index != nil {
+		if !f(b.index) {
+			return
+		}
+		for _, index := range b.indexes {
+			if !f(index) {
+				return
+			}
+		}
+	}
+}
+
+type indexRequest struct {
+	index storage.Index
+	abstractSyncRequest
+}
+
+type closeFileRequest struct {
+	abstractSyncRequest
 }
 
 func (c *Channel) Name() string {
@@ -182,12 +284,19 @@ func (c *Channel) SetCover(cover time.Duration) storage.Channel {
 	return c
 }
 
-func (c *Channel) FileNameFormatter() FileNameFormatter {
-	return c.fileNameFormatter.Load().(FileNameFormatter)
+func (c *Channel) WriteBufferSize() uint {
+	return c.writeBufferSize
 }
 
-func (c *Channel) SetFileNameFormatter(formatter FileNameFormatter) *Channel {
-	c.fileNameFormatter.Store(formatter)
+func (c *Channel) FileNameFormatter() storage.FileNameFormatter {
+	if fileNameFormatter := c.fileNameFormatter.Load(); fileNameFormatter != nil {
+		return *fileNameFormatter
+	}
+	return nil
+}
+
+func (c *Channel) SetFileNameFormatter(formatter storage.FileNameFormatter) storage.FileChannel {
+	c.fileNameFormatter.Store(&formatter)
 	return c
 }
 
@@ -198,273 +307,101 @@ func (c *Channel) Directory() string {
 	return ""
 }
 
-func (c *Channel) SetDirectory(directory string) *Channel {
+func (c *Channel) SetDirectory(directory string) storage.FileChannel {
 	c.directory.Store(&directory)
 	return c
 }
 
-func (c *Channel) BlockSize() unit.Size {
-	return c.blockSize
+func (c *Channel) MetaManager() meta.Manager {
+	return c.metaManager
 }
 
-func (c *Channel) KeyFrameBlockSize() unit.Size {
-	return c.keyFrameBlockSize
-}
-
-func (c *Channel) MaxBlockSize() unit.Size {
-	return c.maxBlockSize
-}
-
-func (c *Channel) FileSize() unit.Size {
-	return c.fileSize
-}
-
-func (c *Channel) openFile(file *File) error {
-	res := context.OpenFile(&context.OpenRequest{
-		File:        file.Path,
-		Flag:        os.O_WRONLY | os.O_CREATE | os.O_SYNC,
-		FileContext: file,
-	})
-	if res.Err != nil {
-		c.switchCtx.Store(nil)
-		c.Logger().ErrorWith("打开文件失败", res.Err, log.String("文件路径", res.File()), log.Duration("花费时间", res.Elapse()))
-		return res.Err
+func (c *Channel) start(_ lifecycle.Lifecycle, interrupter chan struct{}) (err error) {
+	metaWaiter := c.metaManager.StartedWaiter()
+	c.metaManager.Background()
+loop:
+	for {
+		select {
+		case err := <-metaWaiter:
+			if err != nil {
+				return err
+			}
+			break loop
+		case <-interrupter:
+			c.metaManager.Close(nil)
+		}
 	}
-	c.Logger().Info("打开文件成功", log.String("文件路径", res.File()), log.Duration("花费时间", res.Elapse()))
-	if err := c.metaManager.AddFile(file); err != nil {
-		c.newCtx = res.Context
-		c.switchCtx.Store(nil)
-		return err
-	} else {
-		c.switchCtx.Store(res.Context)
-	}
+
+	c.syncTaskExecutor.Start()
+	c.deleteTaskExecutor.Start()
 	return nil
 }
 
-func (c *Channel) closeCtx(ctx *context.Context) error {
-	res := ctx.Close(&context.CloseRequest{})
-	if res.Err != nil {
-		c.Logger().ErrorWith("关闭文件失败", res.Err, log.String("文件路径", res.File()), log.Duration("花费时间", res.CloseElapse))
-		return res.Err
-	}
-	c.Logger().Info("关闭文件成功", log.String("文件路径", res.File()), log.Duration("花费时间", res.CloseElapse))
-	return nil
-}
-
-func (c *Channel) closeAllCtx() {
-	if c.ctx != nil {
-		file := c.ctx.FileContext().(*File)
-		file.State = flag.SwapFlagMask(file.State, FileStateWriting, FileStateWrote)
-		c.closeCtx(c.ctx)
-		c.metaManager.UpdateFile(file)
-	}
-	if switchCtx := c.switchCtx.Load(); switchCtx != nil && switchCtx != c.ctx {
-		file := switchCtx.FileContext().(*File)
-		file.State = flag.SwapFlagMask(file.State, FileStateWriting, FileStateWrote)
-		c.closeCtx(switchCtx)
-		c.metaManager.UpdateFile(file)
-	}
-	if c.newCtx != nil {
-		c.closeCtx(c.newCtx)
-	}
-	c.ctx = nil
-	c.newCtx = nil
-	c.switchCtx.Store(nil)
-}
-
-func (c *Channel) write(switchFile bool) {
-	block := c.writingBlock.Load()
-	if block == nil {
-		return
-	}
-
-	if block.IndexState&(0b11<<1) == IndexStateBlockNotData {
-		index := c.metaManager.BuildIndex(&Index{
-			Start: block.Start.UnixMilli(),
-			End:   block.End.UnixMilli(),
-			State: block.IndexState,
-		})
-		c.metaManager.AddIndex(index)
-		block.Free()
-		return
-	}
-
-	// switchCtx: 文件切换上下文。文件切换分为两个部分，第一部分为新文件的打开，第二部分为
-	// 旧文件的关闭。在文件切换期间，文件切换上下文不为 nil，同时文件切换上下文为原子变量，
-	// 从而保证了串行的切换文件上下文
-	switchCtx := c.switchCtx.Load()
-	if switchCtx != nil || switchFile || c.ctx == nil {
-		// switchCtx != nil 代表正在切换文件
-		// switchFile 代表要求切换文件
-		// c.ctx == nil 代表需要打开文件
-		if switchFile || c.ctx == nil {
-			if switchCtx != nil && c.ctx == switchCtx {
-				// 正在打开文件，等待文件打开完成，文件打开完成后，获取 switchCtx，此时
-				// switchCtx 为空则说明文件打开失败
-				c.fileTaskList.Wait()
-				switchCtx = c.switchCtx.Load()
-				if switchCtx != nil {
-					file := switchCtx.FileContext().(*File)
-					if file.MediaType != block.MediaType || file.StorageType != block.StorageType {
-						file.MediaType = block.MediaType
-						file.StorageType = block.StorageType
-						c.metaManager.UpdateFile(file)
-					}
-				}
-			} else if switchCtx == nil {
-				// 不在切换文件，则主动切换文件
-				if c.newCtx != nil {
-					// 文件打开成功，但是文件信息没有写入成功，重新写入文件信息
-					newFile := c.newCtx.FileContext().(*File)
-					newFile.MediaType = block.MediaType
-					newFile.StorageType = block.StorageType
-					if err := c.metaManager.AddFile(newFile); err == nil {
-						// 文件信息写入成功
-						switchCtx = c.newCtx
-						c.switchCtx.Store(switchCtx)
-						c.newCtx = nil
-					}
-				} else {
-					// 以同步方式打开文件，文件打开完成后，获取 switchCtx，此时
-					// switchCtx 为空则说明文件打开失败
-					newFile := c.metaManager.NewFile(time.Now().UnixMilli(), block.MediaType, block.StorageType)
-					c.openFile(newFile)
-					switchCtx = c.switchCtx.Load()
-				}
-			}
-		}
-		if c.ctx != switchCtx {
-			// 文件切换上下文有变化，此时需要关闭旧文件(如果旧文件存在)
-			if oldCtx := c.ctx; oldCtx != nil {
-				c.fileTaskList.Async(taskPkg.Func(func() {
-					oldFile := oldCtx.FileContext().(*File)
-					oldFile.State = flag.SwapFlagMask(oldFile.State, FileStateWriting, FileStateWrote)
-					c.closeCtx(oldCtx)
-					c.metaManager.UpdateFile(oldFile)
-					c.switchCtx.Store(nil)
-				}))
-			} else {
-				c.switchCtx.Store(nil)
-			}
-			c.ctx = switchCtx
-		}
-	}
-
-	//size := block.Size()
-	if c.ctx == nil {
-		// 文件打开失败，作为IO错误写入索引中
-		index := c.metaManager.BuildIndex(&Index{
-			Start: block.Start.UnixMilli(),
-			End:   block.End.UnixMilli(),
-			State: block.IndexState,
-		})
-		index.State |= IndexStateBlockIOError
-		c.metaManager.AddIndex(index)
-		block.Free()
-		return
-	}
-	file := c.ctx.FileContext().(*File)
-
-	n, _ := block.Read(c.writeBuffer)
-	data := c.writeBuffer[:n]
-
-	//data := c.writeBufferPool.Alloc(size)
-	//block.Read(data.Data)
-	// 获取写之前的文件指针偏移
-	offset := c.ctx.Offset()
-	res := c.ctx.Write(&context.WriteRequest{Data: data})
-	if res.Err != nil {
-		c.Logger().ErrorWith("写文件失败", res.Err,
-			log.String("文件路经", res.File()),
-			log.Int("数据大小", len(data)),
-			log.Int64("写入大小", res.Size),
-			log.Int64("写入位置", res.Offset),
-			log.Duration("花费时间", res.Elapse()),
-		)
-	} else {
-		c.Logger().Debug("写入文件成功",
-			log.String("文件路经", res.File()),
-			log.Int("数据大小", len(data)),
-			log.Int64("写入大小", res.Size),
-			log.Int64("写入位置", res.Offset),
-			log.Duration("花费时间", res.Elapse()),
-		)
-	}
-
-	// 创建并插入索引
-	index := c.metaManager.BuildIndex(&Index{
-		Start:      block.Start.UnixMilli(),
-		End:        block.End.UnixMilli(),
-		FileSeq:    file.Seq,
-		FileOffset: uint64(offset),
-		Size:       uint64(res.Size),
-		State:      block.IndexState,
-	})
-	if res.Err != nil {
-		index.State |= IndexStateBlockIOError
-	}
-	c.metaManager.AddIndex(index)
-	block.Free()
-
-	if file.StartTime == 0 {
-		file.StartTime = index.Start
-	}
-	file.EndTime = index.End
-	file.Size = uint64(res.Context.Size())
-	if file.Size >= uint64(c.fileSize) || file.Duration() >= c.fileDuration {
-		if c.switchCtx.CompareAndSwap(nil, c.ctx) {
-			if c.newCtx != nil {
-				newFile := c.newCtx.FileContext().(*File)
-				newFile.MediaType = file.MediaType
-				newFile.StorageType = file.StorageType
-				if err := c.metaManager.AddFile(newFile); err != nil {
-					c.switchCtx.Store(nil)
-				} else {
-					c.switchCtx.Store(c.newCtx)
-					c.newCtx = nil
-				}
-			} else {
-				newFile := c.metaManager.NewFile(time.Now().UnixMilli(), file.MediaType, file.StorageType)
-				c.fileTaskList.Async(taskPkg.Func(func() { c.openFile(newFile) }))
-			}
-		}
-	}
-}
-
-func (c *Channel) deleterRun(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+func (c *Channel) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
 	ticker := time.NewTicker(c.checkDeleteInterval)
-	defer ticker.Stop()
+	defer func() {
+		ticker.Stop()
+		c.readSessions.Range(func(session *ReadSession, _ struct{}) bool {
+			session.Shutdown()
+			return true
+		})
 
+		c.closeFile()
+		c.syncTaskExecutor.Close(nil)
+		c.deleteTaskExecutor.Close(nil)
+		<-c.syncTaskExecutor.ClosedWaiter()
+		<-c.deleteTaskExecutor.ClosedWaiter()
+		c.metaManager.Shutdown()
+	}()
+
+	var curFile *meta.File
+	deleteCurFile := func() {
+		if lock.LockGet(&c.deleteFilesLock, func() bool { return c.deleteFiles.Push(curFile) }) {
+			curFile = nil
+			c.Logger().Debug("最早的文件已没有索引指向，删除此文件")
+			c.deleteTaskExecutor.Try(taskPkg.Interrupted(c.doDelete))
+		} else {
+			c.Logger().Debug("删除文件的任务已满，忽略此次提交的任务")
+		}
+	}
 	for {
 		select {
 		case now := <-ticker.C:
 			// 检查最早的索引是否过期
-			first := c.metaManager.FirstIndex()
-			//last := c.metaManager.LastIndex()
+			first, _ := c.metaManager.FirstIndex()
 			if first != nil {
-				if c.metaManager.Offset(now.UnixMilli())-first.End > c.Cover().Milliseconds() {
-					c.Logger().Debug("最早的索引已过期，删除此索引", log.Object("索引", first), log.Int64("now", c.metaManager.Offset(now.UnixMilli())), log.Int64("first", first.End), log.Int64("cover", c.Cover().Milliseconds()))
+				offsetNow := c.metaManager.Offset(now.UnixMilli())
+				if offsetNow-first.End() > c.Cover().Milliseconds() {
+					c.Logger().Debug("最早的索引已过期，删除此索引",
+						log.Object("索引", first),
+						log.Int64("当前时间", offsetNow),
+						log.Int64("最早索引的结束时间", first.End()),
+						log.Int64("覆盖周期", c.Cover().Milliseconds()),
+					)
 					// 删除过期的索引
 					c.metaManager.DeleteIndex()
-					if first.FileSeq != 0 {
-						if firstFile := c.metaManager.FirstFile(); firstFile.Seq < first.FileSeq {
-							c.Logger().Debug("最早的文件已没有索引指向，删除此文件")
-							if ok, _ := c.fileDeleteTaskList.Try(taskPkg.Func(func() {
-								res := context.Remove(&context.RemoveRequest{File: firstFile.Path})
-								if res.Err != nil {
-									c.Logger().ErrorWith("删除文件失败", res.Err, log.String("文件路径", res.Request.File), log.Duration("花费时间", res.DeleteElapse))
-									return
+					// 判断索引对应的文件是否需要删除。有些索引没有指向文件(索引的文件序列号为0，如流丢
+					// 失索引)，这些索引不需要判断
+					if first.FileSeq() != 0 {
+						if curFile != nil && first.FileSeq() > curFile.Seq {
+							// 当前索引对应的文件序号高于上一个索引对应的文件，删除上一个索引对应的文件
+							deleteCurFile()
+						}
+						if file := c.metaManager.GetFile(first.FileSeq()); file != nil {
+							curFile = file
+							if next, loaded := c.metaManager.FirstIndex(); loaded {
+								if next == nil || (next.FileSeq() != 0 && next.FileSeq() > first.FileSeq()) {
+									// 下一个索引不存在或是对应的文件序号高于当前索引对应的文件，删除
+									// 当前索引对应的文件
+									deleteCurFile()
 								}
-								c.Logger().Info("删除文件成功", log.String("文件路径", res.Request.File), log.Duration("花费时间", res.DeleteElapse))
-							})); ok {
-								c.metaManager.DeleteFile(firstFile)
-							} else {
-								c.Logger().Warn("删除文件的任务已满，忽略此次提交的任务")
 							}
 						}
 					}
 					continue
 				}
+			} else if curFile != nil {
+				deleteCurFile()
 			}
 		case <-interrupter:
 			return nil
@@ -472,55 +409,8 @@ func (c *Channel) deleterRun(_ lifecycle.Lifecycle, interrupter chan struct{}) e
 	}
 }
 
-func (c *Channel) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
-	go c.metaManager.Start()
-
-	select {
-	case err := <-c.metaManager.StartedWaiter():
-		if err != nil {
-			return err
-		}
-	case <-interrupter:
-		return lifecycle.NewInterruptedError(c.DisplayName(), "启动")
-	}
-
-	c.fileTaskList.Start()
-	c.fileDeleteTaskList.Start()
-	c.deleter.Start()
-	c.writer.Start()
-
-	return nil
-}
-
-func (c *Channel) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
-	<-interrupter
-
-	c.readSessions.Range(func(key, _ any) bool {
-		key.(*ReadSession).Shutdown()
-		return true
-	})
-
-	// writer 依赖 metaManager, fileTaskList
-	c.sync()
-	c.writer.Shutdown()
-	c.closeAllCtx()
-
-	// deleter 依赖 metaManager, fileDeleteTaskList
-	c.deleter.Shutdown()
-	// fileDeleteTaskList 不依赖其他组件
-	c.fileDeleteTaskList.Close(nil)
-	// fileTaskList 依赖 metaManager
-	c.fileTaskList.Shutdown()
-	// metaManager 不依赖其他组件
-	c.metaManager.Close(nil)
-	<-c.fileDeleteTaskList.ClosedWaiter()
-	<-c.metaManager.ClosedWaiter()
-
-	return nil
-}
-
 func (c *Channel) MakeIndexes(cap int) storage.Indexes {
-	return make(Indexes, 0, cap)
+	return c.metaManager.MakeIndexes(cap)
 }
 
 func (c *Channel) FindIndexes(start, end int64, limit int, indexes storage.Indexes) (storage.Indexes, error) {
@@ -528,7 +418,7 @@ func (c *Channel) FindIndexes(start, end int64, limit int, indexes storage.Index
 		if !c.runner.Running() {
 			return nil, ChannelNotAvailableError
 		}
-		return c.metaManager.FindIndexes(start, end, limit, indexes.(Indexes))
+		return c.metaManager.FindIndexes(start, end, limit, indexes)
 	})
 }
 
@@ -548,183 +438,346 @@ func (c *Channel) NewReadSession() (storage.ReadSession, error) {
 	})
 }
 
-func (c *Channel) needSwitchFile(block *Block) bool {
-	return block != nil && block.Len() > 0 &&
-		(block.MediaType != c.lastBlockMediaType || block.StorageType != c.lastBlockStorageType)
+func (c *Channel) openCtx(file *meta.File) error {
+	res := context.OpenFile(&context.OpenRequest{
+		File:        file.Path,
+		Flag:        os.O_WRONLY | os.O_CREATE | os.O_SYNC,
+		FileContext: file,
+	})
+	if res.Err != nil {
+		return c.Logger().ErrorWith("打开文件失败", res.Err, log.String("文件路径", file.Path), log.Duration("花费时间", res.Elapse()))
+	}
+	c.fileCtx = res.Context
+	c.Logger().Info("打开文件成功", log.String("文件路径", file.Path), log.Duration("花费时间", res.Elapse()))
+	return nil
 }
 
-func (c *Channel) asyncWrite(blocks ...*Block) bool {
-	block := c.block
-	if block == nil {
-		if len(blocks) == 0 {
-			return false
-		}
-		block = blocks[0]
-		blocks = blocks[1:]
+func (c *Channel) closeCtx() error {
+	res := c.fileCtx.Close(&context.CloseRequest{})
+	c.fileCtx = nil
+	if res.Err != nil {
+		return c.Logger().ErrorWith("关闭文件失败", res.Err, log.String("文件路径", res.File()), log.Duration("花费时间", res.CloseElapse))
 	}
-	if c.writingBlock.CompareAndSwap(nil, block) {
-		// 上一次的写任务已完成，开始异步写入此数据块，在写入数据块之前，检查之前是否有丢
-		// 弃的帧，如果有，则将丢帧信息添加到索引中
-		if c.droppedBlock != nil {
-			c.metaManager.AddIndex(c.metaManager.BuildIndex(&Index{
-				Start: c.droppedBlock.Start.UnixMilli(),
-				End:   c.droppedBlock.Start.UnixMilli(),
-				Size:  uint64(c.droppedBlock.Size()),
-				State: IndexStateBlockDropped,
-			}))
-			c.droppedBlock = nil
-		}
-		switchFile := c.needSwitchFile(block)
-		if block.MediaType != 0 && block.StorageType != 0 {
-			c.lastBlockMediaType = block.MediaType
-			c.lastBlockStorageType = block.StorageType
-		}
-		switchFiles := make([]bool, len(blocks))
-		for i, block := range blocks {
-			switchFiles[i] = c.needSwitchFile(block)
-			if block.MediaType != 0 && block.StorageType != 0 {
-				c.lastBlockMediaType = block.MediaType
-				c.lastBlockStorageType = block.StorageType
+	c.Logger().Info("关闭文件成功", log.String("文件路径", res.File()), log.Duration("花费时间", res.CloseElapse))
+	return nil
+}
+
+func (c *Channel) doSync() {
+	reqs := lock.LockGet(&c.syncReqsLock, c.syncReqs.PopAll)
+	for _, req := range reqs {
+		switch request := req.(type) {
+		case *blockRequest:
+			var file *meta.File
+			var seek *context.Seek
+			// 如果文件未打开则先打开文件
+			if c.fileCtx == nil {
+				if c.switchFile {
+					// 需要切换文件
+					c.switchFile = false
+				} else {
+					// 第一次同步时，未打开任何文件，需检查是否需要使用最后一个文件
+					if file = c.metaManager.LastFile(); file != nil {
+						if file.Size < uint64(c.fileSize) && file.Duration() < c.fileDuration {
+							seek = &context.Seek{Offset: int64(file.Size)}
+						} else {
+							file.State = flag.SwapFlagMask(file.State, meta.FileStateWriting, meta.FileStateWrote)
+							c.metaManager.UpdateFile(file)
+							file = nil
+						}
+					}
+				}
+
+				var addFile bool
+				if file == nil {
+					addFile = true
+					file = c.metaManager.NewFile(time.Now().UnixMilli(), request.index.StorageType())
+				}
+
+				if err := c.openCtx(file); err != nil {
+					request.rangeIndex(func(index storage.Index) bool {
+						c.metaManager.AddIndex(index.SetState(meta.IndexStateBlockIOError))
+						return true
+					})
+					c.writeBufferPool.Put(request.buffer)
+					continue
+				}
+				if addFile {
+					if err := c.metaManager.AddFile(file); err != nil {
+						request.rangeIndex(func(index storage.Index) bool {
+							c.metaManager.AddIndex(index.SetState(meta.IndexStateBlockDropped))
+							return true
+						})
+						c.writeBufferPool.Put(request.buffer)
+						continue
+					}
+				}
+			} else {
+				file = c.fileCtx.FileContext().(*meta.File)
+			}
+
+			// 写入数据块
+			var offset uint64
+			if seek != nil {
+				offset = uint64(seek.Offset)
+			} else {
+				offset = uint64(c.fileCtx.Offset())
+			}
+			data := request.buffer.Bytes()
+			res := c.fileCtx.Write(&context.WriteRequest{Data: data, Seek: seek})
+			size := uint64(res.Size)
+			if res.Err != nil {
+				c.Logger().ErrorWith("写文件失败", res.Err,
+					log.String("文件路经", res.File()),
+					log.Int("数据大小", len(data)),
+					log.Uint64("写入大小", size),
+					log.Uint64("写入位置", offset),
+					log.Duration("花费时间", res.Elapse()),
+				)
+			} else {
+				msg := "写入文件成功"
+				var logFn = c.Logger().Debug
+				if elapse := res.Elapse(); elapse > time.Second {
+					msg = "写入文件时间过长"
+					logFn = c.Logger().Warn
+				}
+				logFn(msg,
+					log.String("文件路经", res.File()),
+					log.Int("数据大小", len(data)),
+					log.Uint64("写入大小", size),
+					log.Uint64("写入位置", offset),
+					log.Duration("花费时间", res.Elapse()),
+				)
+			}
+			c.writeBufferPool.Put(request.buffer)
+
+			// 写入数据块索引
+			var start, end int64
+			request.rangeIndex(func(index storage.Index) bool {
+				index.SetFileSeq(file.Seq).SetFileOffset(offset)
+				if index.Size() > size {
+					index.SetSize(size)
+				}
+				if res.Err != nil {
+					index.SetState(meta.IndexStateBlockIOError)
+				}
+				offset += index.Size()
+				size -= index.Size()
+				c.metaManager.AddIndex(index)
+				if start == 0 {
+					start = index.Start()
+				}
+				end = index.End()
+				return true
+			})
+
+			// 修改文件信息，并判断是否需要切换文件
+			if file.StartTime == 0 {
+				file.StartTime = start
+			}
+			file.EndTime = end
+			file.Size = uint64(res.Context.Size())
+			if file.Size >= uint64(c.fileSize) || file.Duration() >= c.fileDuration {
+				file.State = flag.SwapFlagMask(file.State, meta.FileStateWriting, meta.FileStateWrote)
+				c.closeCtx()
+				c.metaManager.UpdateFile(file)
+				c.switchFile = true
+			}
+
+		case *indexRequest:
+			c.metaManager.AddIndex(request.index)
+
+		case *closeFileRequest:
+			if c.fileCtx != nil {
+				file := c.fileCtx.FileContext().(*meta.File)
+				c.closeCtx()
+				c.metaManager.UpdateFile(file)
 			}
 		}
-		if err := c.writer.Async(taskPkg.Func(func() {
-			c.write(switchFile)
-			for i, block := range blocks {
-				c.writingBlock.Store(block)
-				c.write(switchFiles[i])
-			}
-			c.writingBlock.Store(nil)
-		})); err != nil {
-			// 由于写任务线程已关闭，添加到写任务失败，释放 blocks 中的数据块，但不释
-			// 放 c.block
-			if block != c.block {
-				block.Free()
-			}
-			for _, block := range blocks {
-				block.Free()
-			}
-			c.writingBlock.Store(nil)
-			return false
+	}
+}
+
+func (c *Channel) doDelete(interrupter chan struct{}) (interrupted bool) {
+	deleteFiles := lock.LockGet(&c.deleteFilesLock, c.deleteFiles.PopAll)
+	for _, file := range deleteFiles {
+		if err := retry.MakeRetry(retry.Retry{
+			Do: func() error {
+				res := context.Remove(&context.RemoveRequest{File: file.Path})
+				if res.Err != nil {
+					return c.Logger().ErrorWith("删除文件失败", res.Err, log.String("文件路径", res.Request.File), log.Duration("花费时间", res.DeleteElapse))
+				}
+				c.Logger().Info("删除文件成功", log.String("文件路径", res.Request.File), log.Duration("花费时间", res.DeleteElapse))
+				c.metaManager.DeleteFile(file)
+				return nil
+			},
+			MaxRetry:    -1,
+			Interrupter: interrupter,
+		}).Todo(); err == retry.InterruptedError {
+			return true
 		}
-		c.block = nil
-		return true
 	}
 	return false
 }
 
-func (c *Channel) sync() {
-	if c.droppedBlock == nil && c.block == nil {
-		return
+func (c *Channel) sync() error {
+	if c.syncReq != nil {
+		if err := lock.LockGet(&c.syncReqsLock, func() error {
+			c.syncReq.setSynchronizing()
+			if !c.syncReqs.Push(c.syncReq) {
+				return errors.New("busy")
+			}
+			c.syncReq = nil
+			return nil
+		}); err != nil {
+			return err
+		}
+		c.syncTaskExecutor.Try(taskPkg.Func(c.doSync))
+	}
+	return nil
+}
+
+func (c *Channel) writeBlock(writer io.WriterTo, size uint, start, end time.Time, storageType uint32, sync bool) error {
+	if size > c.writeBufferSize {
+		// 写入数据超过缓冲区大小，丢弃此数据块
+		return c.dropBlock(size, start, end, storageType)
 	}
 
-	c.writer.Sync(taskPkg.Func(func() {
-		if c.droppedBlock != nil {
-			c.metaManager.AddIndex(c.metaManager.BuildIndex(&Index{
-				Start: c.droppedBlock.Start.UnixMilli(),
-				End:   c.droppedBlock.Start.UnixMilli(),
-				Size:  uint64(c.droppedBlock.Size()),
-				State: IndexStateBlockDropped,
-			}))
-			c.droppedBlock = nil
+	doWriteBlock := func(blockReq *blockRequest) error {
+		if blockReq != nil {
+			if size > blockReq.buffer.Remain() {
+				if err := c.sync(); err != nil {
+					return err
+				}
+				blockReq = nil
+			}
 		}
-		if c.block != nil {
-			c.writingBlock.Store(c.block)
-			c.write(c.needSwitchFile(c.block))
-			c.writingBlock.Store(nil)
-			c.block = nil
+		if blockReq == nil {
+			blockReq = &blockRequest{
+				buffer: c.writeBufferPool.Get(),
+			}
+			if blockReq.buffer == nil {
+				return c.dropBlock(size, start, end, storageType)
+			}
+			blockReq.buffer.Reset()
+			c.syncReq = blockReq
 		}
-	}))
+		n, _ := writer.WriteTo(blockReq.buffer)
+		blockReq.addIndex(c.metaManager.NewIndex(
+			start.UnixMilli(),
+			end.UnixMilli(),
+			uint64(n),
+			storageType,
+			meta.IndexStateBlockData,
+		))
+		if sync {
+			return c.sync()
+		}
+		return nil
+	}
+
+	if c.syncReq != nil {
+		blockReq, is := c.syncReq.(*blockRequest)
+		if !is {
+			if err := c.sync(); err != nil {
+				return err
+			}
+		}
+		return doWriteBlock(blockReq)
+	} else {
+		return doWriteBlock(nil)
+	}
 }
 
-func (c *Channel) Write(frame storage.Frame) bool {
-	return lock.RLockGet(c.runner, func() bool {
+func (c *Channel) dropBlock(size uint, start, end time.Time, storageType uint32) error {
+	c.Logger().Warn("数据块被丢弃", log.Uint("数据块大小", size), log.Time("起始时间", start), log.Time("结束时间", end))
+	if err := c.sync(); err != nil {
+		return err
+	}
+	c.syncReq = &indexRequest{
+		index: c.metaManager.NewIndex(
+			start.UnixMilli(),
+			end.UnixMilli(),
+			uint64(size),
+			storageType,
+			meta.IndexStateBlockDropped,
+		),
+	}
+	return c.sync()
+}
+
+func (c *Channel) streamLost(start, end time.Time) error {
+	if err := c.sync(); err != nil {
+		return err
+	}
+	c.syncReq = &indexRequest{
+		index: c.metaManager.NewIndex(
+			start.UnixMilli(),
+			end.UnixMilli(),
+			0, 0,
+			meta.IndexStateBlockNotData|meta.IndexStateStreamLost,
+		),
+	}
+	return c.sync()
+}
+
+func (c *Channel) closeFile() error {
+	if err := c.sync(); err != nil {
+		return err
+	}
+	c.syncReq = &closeFileRequest{}
+	return c.sync()
+}
+
+type writer []byte
+
+func (w writer) WriteTo(_w io.Writer) (n int64, err error) {
+	in, err := _w.Write(w)
+	return int64(in), err
+}
+
+func Writer(data []byte) io.WriterTo {
+	return writer(data)
+}
+
+func (c *Channel) Write(writer io.WriterTo, size uint, start, end time.Time, storageType uint32, sync bool) error {
+	return lock.RLockGet(c.runner, func() error {
 		if !c.runner.Running() {
-			return false
+			return lifecycle.NewStateNotRunningError(c.DisplayName())
 		}
-
-		return lock.LockGet(&c.writeLock, func() bool {
-			var size uint
-			var duration time.Duration
-			if c.block != nil {
-				size = c.block.Size()
-				duration = c.block.Duration()
-			}
-			frameDuration := frame.EndTime().Sub(frame.StartTime())
-
-			if frame.Size() > uint(c.maxBlockSize) || frameDuration > c.maxBlockDuration {
-				if c.droppedBlock == nil {
-					c.droppedBlock = new(DroppedBlock)
-				}
-				c.droppedBlock.Append(frame)
-				return false
-			}
-
-			// 切换数据块的条件一：数据块的媒体类型或存储类型发生改变
-			cond1 := c.block != nil && c.block.Len() > 0 && (frame.MediaType() != c.block.MediaType || frame.StorageType() != c.block.StorageType)
-			// 切换数据块的条件二：数据块的大小加上当前帧的大小或持续时间加上当前帧的持续时间后
-			// 超过了最大限定值
-			cond2 := size+frame.Size() > uint(c.maxBlockSize) || duration+frameDuration > c.maxBlockDuration
-
-			if c.droppedBlock != nil || (cond1 || cond2) {
-				// 如果上一帧被丢弃，此时重新尝试添加写任务，或是满足上面这两个切换数据块的条件
-				// 之一，此时如果没有添加成功，则会引起当前帧丢弃
-				if !c.asyncWrite() {
-					if c.droppedBlock == nil {
-						c.droppedBlock = new(DroppedBlock)
-					}
-					c.droppedBlock.Append(frame)
-					return false
-				}
-			} else if c.block != nil && size >= uint(c.blockSize) || duration >= c.blockDuration {
-				// 当前的块大小或持续时间超过了阈值
-				if frame.KeyFrame() || size >= uint(c.keyFrameBlockSize) || duration >= c.blockDuration {
-					// 如果此帧为关键帧，则尝试将关键帧之前的数据块添加到写任务中，如果此帧不是
-					// 关键帧，但是块大小或持续时间超过了关键帧阈值，也尝试将数据块添加到写任务
-					// 中。如果没有添加成功，也不会引起丢帧
-					c.asyncWrite()
-				}
-			}
-
-			if c.block == nil {
-				c.block = new(Block)
-			}
-			c.block.Append(frame)
-
-			return true
+		return lock.LockGet(&c.writeLock, func() error {
+			return c.writeBlock(writer, size, start, end, storageType, sync)
 		})
 	})
 }
 
-func (c *Channel) WriteStreamLost(start, end time.Time) bool {
-	return lock.RLockGet(c.runner, func() bool {
+func (c *Channel) WriteStreamLost(start, end time.Time) error {
+	return lock.RLockGet(c.runner, func() error {
 		if !c.runner.Running() {
-			return false
+			return lifecycle.NewStateNotRunningError(c.DisplayName())
 		}
-
-		return lock.LockGet(&c.writeLock, func() bool {
-			if !c.asyncWrite(&Block{
-				Start:      start,
-				End:        end,
-				IndexState: IndexStateBlockNotData | IndexStateStreamLost,
-			}) {
-				if c.droppedBlock != nil {
-					c.droppedBlock = new(DroppedBlock)
-				}
-				c.droppedBlock.Add(start, end, 0)
-				return false
-			}
-			return true
+		return lock.LockGet(&c.writeLock, func() error {
+			return c.streamLost(start, end)
 		})
 	})
 }
 
-func (c *Channel) Sync() {
-	lock.RLockDo(c.runner, func() {
+func (c *Channel) Sync() error {
+	return lock.RLockGet(c.runner, func() error {
 		if !c.runner.Running() {
-			return
+			return lifecycle.NewStateNotRunningError(c.DisplayName())
 		}
-		lock.LockDo(&c.writeLock, func() {
-			c.asyncWrite()
+		return lock.LockGet(&c.writeLock, func() error {
+			return c.sync()
+		})
+	})
+}
+
+func (c *Channel) CloseFile() error {
+	return lock.RLockGet(c.runner, func() error {
+		if !c.runner.Running() {
+			return lifecycle.NewStateNotRunningError(c.DisplayName())
+		}
+		return lock.LockGet(&c.writeLock, func() error {
+			return c.closeFile()
 		})
 	})
 }

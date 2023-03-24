@@ -1,6 +1,6 @@
 package sip
 
-import errPkg "gitee.com/sy_183/cvds-mas/errors"
+import "gitee.com/sy_183/common/errors"
 
 type Message struct {
 	LocalIp     string   `json:"localIp,omitempty"`
@@ -26,7 +26,7 @@ func (m *Message) Check() error {
 		m.To.Address.URI == "" ||
 		len(m.Via) == 0 ||
 		m.CallId == "" {
-		return errPkg.NewArgumentMissing(
+		return errors.NewArgumentMissing(
 			"message.from",
 			"message.to",
 			"message.via",

@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/common/unit"
-	defaultLogger "gitee.com/sy_183/cvds-mas/logger"
+	"gitee.com/sy_183/cvds-mas/config"
 	"os"
 	"sync"
 	"time"
 )
 
-var logger = defaultLogger.Logger()
+var logger = config.DefaultLogger()
 
 func main() {
 	waiter := sync.WaitGroup{}

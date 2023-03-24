@@ -3,10 +3,11 @@ package channel
 import (
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/cvds-mas/config"
+	"gitee.com/sy_183/cvds-mas/media"
 )
 
 const (
-	Module     = "media.channel"
+	Module     = media.Module + ".channel"
 	ModuleName = "媒体通道"
 )
 

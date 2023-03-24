@@ -1,269 +1,502 @@
 package ps
 
 import (
-	"bytes"
 	"encoding/binary"
+	"errors"
+	"gitee.com/sy_183/cvds-mas/parser"
 )
 
 const (
-	stateParseStartCodePrefix = iota
-	stateParseStartCodeSuffix
-	stateParsePackHeader
-	stateParseSystemHeader
-	stateParseSystemHeaderStreamInfos
-	stateParsePSM
-	stateParsePSM_PESHeader
-	stateParsePES
+	parserStateFindStartCode = iota
+	parserStateParsePSH
+	parserStateParsePSHStuffing
+	parserStateParseSYS
+	parserStateParseSYSStreamInfos
+	parserStateParsePSMPacketLength
+	parserStateParsePSMHeader
+	parserStateParsePESPacketLength
+	parserStateParseHeaderDataLength
+	parserStateParsePESHeader
+	parserStateParsePacketData
 )
 
-var startCodePrefixArray = [3]byte{0, 0, 1}
-var startCodePrefix = startCodePrefixArray[:]
-
-type readContext struct {
-	len int
-	buf []byte
-}
-
-func (c *readContext) reset(len int) *readContext {
-	c.len = len
-	c.buf = c.buf[:0]
-	return c
-}
-
-func (c *readContext) read(buf []byte) (remain []byte, ok bool) {
-	if c.len == 0 {
-		return buf, true
-	}
-	if c.len <= len(buf) {
-		if len(c.buf) == 0 {
-			c.buf, remain = buf[:c.len], buf[c.len:]
-			c.len = 0
-		} else {
-			c.buf, remain = append(c.buf, buf[:c.len]...), buf[c.len:]
-			c.len = 0
-		}
-		return remain, true
-	}
-	c.buf = append(c.buf, buf...)
-	c.len -= len(buf)
-	return nil, false
-}
-
-type findContext struct {
-	sub []byte
-	buf []byte
-}
-
-func (c *findContext) find(buf []byte) (remain []byte, ok bool) {
-	if len(c.buf)+len(buf) < len(c.sub) {
-		c.buf = append(c.buf, buf...)
-		return nil, false
-	}
-	if len(c.buf) > 0 {
-		if len(buf) <= len(c.sub) {
-			c.buf = append(c.buf, buf...)
-			if i := bytes.Index(c.buf, c.sub); i >= 0 {
-				c.buf = c.buf[i+len(c.sub):]
-				return nil, true
-			}
-			c.buf = c.buf[len(c.buf)-len(c.sub)+1:]
-			return nil, false
-		}
-		c.buf = append(c.buf, buf[:len(c.sub)]...)
-		if i := bytes.Index(c.buf, c.sub); i >= 0 {
-			c.buf = c.buf[i+len(c.sub):]
-			return buf[len(c.sub):], true
-		}
-		c.buf = c.buf[:0]
-	}
-	if i := bytes.Index(buf, c.sub); i > 0 {
-		return buf[i+len(c.sub):], true
-	}
-	c.buf = buf[len(buf)-len(c.sub)+1:]
-	return nil, false
-}
+var (
+	SysHeaderLengthError              = errors.New("PS SYS 头部长度错误")
+	PSMLengthError                    = errors.New("PS PSM 包长度错误")
+	PSMElementaryStreamMapLengthError = errors.New("PS PSM ElementaryStreamMap 长度错误")
+	PESLengthError                    = errors.New("PS PES 包长度错误")
+	PESDataLengthError                = errors.New("PS PEM HeaderData 长度错误")
+)
 
 type Parser struct {
-	layer   *Layer
-	buf     []byte
-	readLen int
-	inBuf   []byte
-	outBuf  []byte
-	off     int
-	state   int
-	fd      findContext
-	rd      readContext
+	psh *PSH
+	sys *SYS
+	psm *PSM
+	pes *PES
+
+	startCodeFinder StartCodeFinder
+	startCode       [4]byte
+
+	needParser parser.NeedParser
+
+	state int
 }
 
-func (p *Parser) find(buf []byte) (remain []byte, ok bool) {
-	if len(p.inBuf)+len(buf) < len(startCodePrefix) {
-		p.inBuf = append(p.inBuf, buf...)
-		return nil, false
+func (p *Parser) Reset() {
+	if p.psh != nil {
+		p.psh.Clear()
 	}
-	if len(p.inBuf) > 0 {
-		if len(buf) <= len(startCodePrefix) {
-			p.inBuf = append(p.inBuf, buf...)
-			if i := bytes.Index(p.inBuf, startCodePrefix); i >= 0 {
-				p.inBuf = p.inBuf[i+len(startCodePrefix):]
-				return nil, true
-			}
-			p.inBuf = p.inBuf[len(p.inBuf)-len(startCodePrefix)+1:]
-			return nil, false
-		}
-		p.inBuf = append(p.inBuf, buf[:len(startCodePrefix)]...)
-		if i := bytes.Index(p.inBuf, startCodePrefix); i >= 0 {
-			p.inBuf = p.inBuf[i+len(startCodePrefix):]
-			return buf[len(startCodePrefix):], true
-		}
-		p.inBuf = p.inBuf[:0]
+	if p.sys != nil {
+		p.sys.Clear()
 	}
-	if i := bytes.Index(buf, startCodePrefix); i > 0 {
-		return buf[i+len(startCodePrefix):], true
+	if p.psm != nil {
+		p.psm.Clear()
 	}
-	p.inBuf = buf[len(buf)-len(startCodePrefix)+1:]
-	return nil, false
+	if p.pes != nil {
+		p.pes.Clear()
+	}
+	p.needParser.Reset()
+	p.state = parserStateFindStartCode
+	p.startCodeFinder.Reset()
+	p.startCode = [4]byte{}
 }
 
-func (p *Parser) read(buf []byte) (remain []byte, ok bool) {
-	if len(p.inBuf) >= p.readLen {
-		remain, p.outBuf = buf, p.inBuf[:p.readLen]
-		p.inBuf = p.inBuf[p.readLen:]
-		p.readLen = 0
-		return
-	}
-	cut := p.readLen - len(p.inBuf)
-	if len(buf) < cut {
-		p.inBuf = append(p.inBuf, buf...)
-		p.readLen -= len(buf)
-		return nil, false
-	}
-	if len(p.inBuf) == 0 {
-		p.outBuf = buf[:cut]
-	} else {
-		p.outBuf = append(p.outBuf, buf[:cut]...)
-	}
-	p.readLen = 0
-	remain = buf[cut:]
-	p.buf = p.buf[:0]
+func (p *Parser) SetPSH(psh *PSH) (old *PSH) {
+	old = p.psh
+	p.psh = psh
 	return
 }
 
-func (p *Parser) parseStartCodeSuffix(suffix byte) {
-	switch suffix {
-	case PackStartCode & 0x000000ff:
-		p.state = stateParsePackHeader
-	case SystemHeaderStartCode & 0x000000ff:
-		p.state = stateParseSystemHeader
-	//case StreamIdProgramStreamMap:
-	//	p.state = stateParsePSM
-	default:
-		p.state = stateParsePES
-	}
+func (p *Parser) SetSYS(sys *SYS) (old *SYS) {
+	old = p.sys
+	p.sys = sys
+	return
 }
 
-func (p *Parser) Parse(buf []byte) (remain []byte, err error) {
-	var ok bool
-	layer := p.layer
-	for len(buf) > 0 {
+func (p *Parser) SetPSM(psm *PSM) (old *PSM) {
+	old = p.psm
+	p.psm = psm
+	return
+}
+
+func (p *Parser) SetPES(pes *PES) (old *PES) {
+	old = p.pes
+	p.pes = pes
+	return
+}
+
+func (p *Parser) findStartCode(data []byte, remainP *[]byte) (ok bool) {
+	p.startCode, *remainP, ok = p.startCodeFinder.Find(data)
+	if ok {
+		switch p.startCode[3] {
+		case 0xBA:
+			p.psh.startCode = p.startCode
+			p.state = parserStateParsePSH
+			p.needParser.SetNeed(10)
+		case 0xBB:
+			p.sys.startCode = p.startCode
+			p.state = parserStateParseSYS
+			p.needParser.SetNeed(8)
+		case StreamIdProgramStreamMap:
+			p.psm.startCode = p.startCode
+			p.state = parserStateParsePSMPacketLength
+			p.needParser.SetNeed(2)
+		default:
+			p.pes.startCode = p.startCode
+			p.state = parserStateParsePESPacketLength
+			p.needParser.SetNeed(2)
+		}
+	}
+	return
+}
+
+func (p *Parser) parsePSH(data []byte, remainP *[]byte) bool {
+	if p.needParser.ParseP(data, remainP) {
+		copy(p.psh.bytes10[:], p.needParser.Merge())
+		p.state = parserStateParsePSHStuffing
+		p.needParser.SetNeed(int(p.psh.PackStuffingLength()))
+		return true
+	}
+	return false
+}
+
+func (p *Parser) parsePSHStuffing(data []byte, remainP *[]byte) bool {
+	if p.needParser.SkipP(data, remainP) {
+		p.state = parserStateFindStartCode
+		return true
+	}
+	return false
+}
+
+func (p *Parser) parseSYS(data []byte, remainP *[]byte) (ok bool, err error) {
+	if p.needParser.ParseP(data, remainP) {
+		sys := p.sys
+		raw := p.needParser.Merge()
+		sys.headerLength = binary.BigEndian.Uint16(raw)
+		siDataSize := sys.headerLength - 6
+		if siDataSize < 0 || siDataSize%3 != 0 {
+			return false, SysHeaderLengthError
+		}
+		copy(sys.bytes6[:], raw[2:])
+		p.state = parserStateParseSYSStreamInfos
+		p.needParser.SetNeed(int(siDataSize))
+		return true, nil
+	}
+	return false, nil
+}
+
+func (p *Parser) parseSYSStreamInfos(data []byte, remainP *[]byte) bool {
+	if p.needParser.ParseP(data, remainP) {
+		sys := p.sys
+		raw := p.needParser.Merge()
+		siLength := p.needParser.Need() / 3
+		for i := 0; i < siLength; i++ {
+			sys.streamInfos = append(sys.streamInfos, SysStreamInfo{
+				streamId: raw[0],
+				bytes2:   [2]byte{raw[1], raw[2]},
+			})
+			raw = raw[3:]
+		}
+		p.state = parserStateFindStartCode
+		return true
+	}
+	return false
+}
+
+func (p *Parser) parsePSMPacketLength(data []byte, remainP *[]byte) (ok bool, err error) {
+	if p.needParser.ParseP(data, remainP) {
+		psm := p.psm
+		raw := p.needParser.Merge()
+		psm.packetLength = binary.BigEndian.Uint16(raw)
+		if psm.packetLength < 10 {
+			return false, PSMLengthError
+		}
+		p.state = parserStateParsePSMHeader
+		p.needParser.SetNeed(int(psm.packetLength))
+		return true, nil
+	}
+	return false, nil
+}
+
+func (p *Parser) parsePSMHeader(data []byte, remainP *[]byte) (ok bool, err error) {
+	if p.needParser.ParseP(data, remainP) {
+		psm := p.psm
+		raw := p.needParser.Merge()
+		min := uint16(10)
+
+		psm.programStreamInfoLength = binary.BigEndian.Uint16(raw[2:])
+		if min += psm.programStreamInfoLength; psm.packetLength < min {
+			return false, PSMLengthError
+		}
+		psm.bytes2[0], psm.bytes2[1] = raw[0], raw[1]
+		raw = raw[4:]
+		psm.descriptors = raw[:psm.programStreamInfoLength]
+		raw = raw[psm.programStreamInfoLength:]
+
+		psm.elementaryStreamMapLength = binary.BigEndian.Uint16(raw)
+		raw = raw[2:]
+		if min += psm.elementaryStreamMapLength; psm.packetLength < min {
+			return false, PSMLengthError
+		}
+
+		esiRaw := raw[:psm.elementaryStreamMapLength]
+		var esiMin uint16
+		for len(esiRaw) > 4 {
+			if esiMin += 4; psm.elementaryStreamMapLength < esiMin {
+				return false, PSMElementaryStreamMapLengthError
+			}
+			info := ElementaryStreamInfo{
+				typ:        esiRaw[0],
+				id:         esiRaw[1],
+				infoLength: binary.BigEndian.Uint16(esiRaw[2:]),
+			}
+			esiRaw = esiRaw[4:]
+			if esiMin += info.infoLength; psm.elementaryStreamMapLength < esiMin {
+				return false, PSMElementaryStreamMapLengthError
+			}
+			info.descriptors = esiRaw[:info.infoLength]
+			esiRaw = esiRaw[info.infoLength:]
+			psm.elementaryStreamInfos = append(psm.elementaryStreamInfos, info)
+		}
+		if len(esiRaw) > 0 {
+			return false, PSMElementaryStreamMapLengthError
+		}
+		raw = raw[psm.elementaryStreamMapLength:]
+
+		psm.crc32 = binary.BigEndian.Uint32(raw)
+		if raw = raw[4:]; len(raw) > 0 {
+			return false, PSMLengthError
+		}
+
+		p.state = parserStateFindStartCode
+		return true, nil
+	}
+	return false, nil
+}
+
+func (p *Parser) parsePESPacketLength(data []byte, remainP *[]byte) (ok bool, err error) {
+	if p.needParser.ParseP(data, remainP) {
+		pes := p.pes
+		raw := p.needParser.Merge()
+		pes.packetLength = binary.BigEndian.Uint16(raw)
+		switch pes.StreamId() {
+		case StreamIdProgramStreamMap,
+			StreamIdPaddingStream,
+			StreamIdPrivateStream2,
+			StreamIdECMStream,
+			StreamIdEMMStream,
+			StreamIdProgramStreamDirectory,
+			StreamIdISO13818_6DSMCCStream,
+			StreamIdITUH2221TypeE:
+			p.pes.packDataLength = p.pes.packetLength
+			p.state = parserStateParsePacketData
+			p.needParser.SetNeed(int(pes.packetLength))
+		default:
+			if pes.packetLength < 3 {
+				return false, PESLengthError
+			}
+			p.state = parserStateParseHeaderDataLength
+			p.needParser.SetNeed(3)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (p *Parser) parsePESHeaderDataLength(data []byte, remainP *[]byte) (ok bool, err error) {
+	if p.needParser.ParseP(data, remainP) {
+		pes := p.pes
+		raw := p.needParser.Merge()
+
+		pes.headerDataLength = raw[2]
+		if pes.packetLength < 3+uint16(pes.headerDataLength) {
+			return false, PESLengthError
+		}
+		pes.bytes2[0], pes.bytes2[1] = raw[0], raw[1]
+		p.state = parserStateParsePESHeader
+		p.needParser.SetNeed(int(pes.headerDataLength))
+		return true, nil
+	}
+	return false, nil
+}
+
+func (p *Parser) parsePESHeader(data []byte, remainP *[]byte) (ok bool, err error) {
+	if p.needParser.ParseP(data, remainP) {
+		pes := p.pes
+		raw := p.needParser.Merge()
+
+		var min uint8
+		if pes.PTS_DTS_Flags() == 0b10 {
+			if min += 5; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			copy(pes.pts[:], raw)
+			raw = raw[5:]
+		} else if pes.PTS_DTS_Flags() == 0b11 {
+			if min += 10; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			copy(pes.pts[:], raw)
+			copy(pes.dts[:], raw[5:])
+			raw = raw[10:]
+		}
+
+		if pes.ESCRFlag() {
+			if min += 6; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			copy(pes.escr[:], raw)
+			raw = raw[6:]
+		}
+
+		if pes.ESRateFlag() {
+			if min += 3; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			copy(pes.esRate[:], raw)
+			raw = raw[:3]
+		}
+
+		if pes.DSMTrickModeFlag() {
+			if min += 1; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			pes.dsmTrickMode = raw[0]
+			raw = raw[1:]
+		}
+
+		if pes.AdditionalCopyInfoFlag() {
+			if min += 1; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			pes.additionalCopyInfo = raw[0]
+			raw = raw[1:]
+		}
+
+		if pes.CRCFlag() {
+			if min += 2; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			pes.crc = binary.BigEndian.Uint16(raw)
+			raw = raw[2:]
+		}
+
+		if pes.ExtensionFlag() {
+			if min += 1; pes.headerDataLength < min {
+				return false, PESDataLengthError
+			}
+			extension := &pes.extension
+			extension.base = raw[0]
+			raw = raw[1:]
+
+			if pes.PrivateDataFlag() {
+				if min += 16; pes.headerDataLength < min {
+					return false, PESDataLengthError
+				}
+				copy(extension.privateData[:], raw)
+				raw = raw[16:]
+			}
+
+			if pes.PackHeaderFieldFlag() {
+				if min += 1; pes.headerDataLength < min {
+					return false, PESDataLengthError
+				}
+				extension.packFieldLength = raw[0]
+				raw = raw[1:]
+
+				if min += extension.packFieldLength; pes.headerDataLength < min {
+					return false, PESDataLengthError
+				}
+				extension.packHeader = raw[:extension.packFieldLength]
+				raw = raw[extension.packFieldLength:]
+			}
+
+			if pes.ProgramPacketSequenceCounterFlag() {
+				if min += 2; pes.headerDataLength < min {
+					return false, PESDataLengthError
+				}
+				extension.programPacketSequenceCounter = raw[0]
+				extension.mpeg1mpeg2Identifier = raw[1]
+				raw = raw[2:]
+			}
+
+			if pes.P_STD_BufferFlag() {
+				if min += 2; pes.headerDataLength < min {
+					return false, PESDataLengthError
+				}
+				extension.pSTDBuffer[0] = raw[0]
+				extension.pSTDBuffer[1] = raw[1]
+				raw = raw[2:]
+			}
+
+			if pes.ExtensionFlag2() {
+				if min += 1; pes.headerDataLength < min {
+					return false, PESDataLengthError
+				}
+				extension.extensionFieldLength = raw[0]
+				raw = raw[1:]
+
+				if min += extension.extensionFieldLength; pes.headerDataLength < min {
+					return false, PESDataLengthError
+				}
+				extension.extensionFieldReversed = raw[:extension.extensionFieldLength]
+				raw = raw[extension.extensionFieldLength:]
+			}
+		}
+
+		pes.packDataLength = pes.packetLength - uint16(pes.headerDataLength) - 3
+		p.state = parserStateParsePacketData
+		p.needParser.SetNeed(int(pes.packDataLength))
+		return true, nil
+	}
+	return false, nil
+}
+
+func (p *Parser) parsePESPacketData(data []byte, remainP *[]byte) bool {
+	if p.needParser.ParseP(data, remainP) {
+		p.pes.packetData = p.needParser.Get()
+		p.state = parserStateFindStartCode
+		return true
+	}
+	return false
+}
+
+func (p *Parser) Parse(data []byte) (ok bool, remain []byte, err error) {
+	defer func() {
+		if err != nil {
+			p.Reset()
+		}
+	}()
+	remain = data
+	for len(remain) > 0 {
 		switch p.state {
-		case stateParseStartCodePrefix:
-			buf, ok = p.find(buf)
-			if !ok {
-				return nil, nil
-			}
-			//if len(p.buf) == 0 && len(buf) >= 4 {
-			//	// break and find start code prefix
-			//} else if len(buf)+len(p.buf) >= 4 {
-			//	if len(buf) < 4 {
-			//		cut := len(buf)
-			//		bpp := append(p.buf, buf[:cut]...)
-			//		if i := bytes.Index(bpp, startCodePrefix); i > 0 {
-			//			p.buf = bpp[i+len(startCodePrefix):]
-			//			p.state = stateParseStartCodeSuffix
-			//			return nil, nil
-			//		}
-			//		p.buf = bpp[len(bpp)-2:]
-			//		return nil, nil
-			//	}
-			//	bpp := append(p.buf, buf[:3]...)
-			//	if i := bytes.Index(bpp, startCodePrefix); i > 0 {
-			//		p.buf = bpp[i+len(startCodePrefix):]
-			//		buf = buf[3:]
-			//		p.parseStartCodeSuffix(buf[0])
-			//	} else {
-			//		p.buf = p.buf[:0]
-			//	}
-			//} else {
-			//	p.buf = append(p.buf, buf...)
-			//	return nil, nil
-			//}
-			//if i := bytes.Index(buf, startCodePrefix); i > 0 {
-			//	p.buf = p.buf[:0]
-			//	buf = buf[i+len(startCodePrefix):]
-			//	if len(buf) == 0 {
-			//		p.state = stateParseStartCodeSuffix
-			//		return nil, nil
-			//	}
-			//	p.parseStartCodeSuffix(buf[0])
-			//}
-		case stateParseStartCodeSuffix:
-			p.parseStartCodeSuffix(buf[0])
-		case stateParsePackHeader:
-			var bp []byte
-			psh := &layer.PSH
-			p.rd.read(buf)
-			if buf, bp = p.read(buf, 11); bp == nil {
-				return buf, nil
-			}
-			psh.packStartCode = PackStartCode
-			copy(psh.bytes10[:], bp[1:])
-			p.state = stateParseStartCodePrefix
-		case stateParseSystemHeader:
-			var bp []byte
-			sys := &layer.SYS
-			if buf, bp = p.read(buf, 9); bp == nil {
-				return buf, nil
-			}
-			headerLength := binary.BigEndian.Uint16(bp[1:])
-			if headerLength < 6 || (headerLength-6)%3 != 0 {
-				return buf, SystemHeaderLengthInvalidError
-			}
-			sys.systemHeaderStartCode = SystemHeaderStartCode
-			sys.headerLength = headerLength
-			copy(sys.bytes6[:], bp[3:])
-			p.state = stateParseSystemHeaderStreamInfos
-		case stateParseSystemHeaderStreamInfos:
-			var bp []byte
-			sys := &layer.SYS
-			size := int(sys.headerLength - 6)
-			length := size / 3
-			if buf, bp = p.read(buf, size); bp == nil {
-				return buf, nil
-			}
-			sys.initStreamInfos(length)
-			for i := 0; i < length; i++ {
-				sys.streamInfos[i].streamId = bp[0]
-				sys.streamInfos[i].bytes2[0] = bp[1]
-				sys.streamInfos[i].bytes2[1] = bp[2]
-				bp = bp[3:]
-			}
-			p.state = stateParseStartCodePrefix
-		case stateParsePSM:
-			var bp []byte
-			psm := &layer.PSM
-			if buf, bp = p.read(buf, 3); bp == nil {
-				return buf, nil
-			}
-			psm.packetStartCodePrefix = startCodePrefixArray
-			psm.streamId = bp[0]
-			psm.pesPacketLength = binary.BigEndian.Uint16(bp[1:])
-			p.state = stateParsePSM_PESHeader
-		case stateParsePSM_PESHeader:
+		case parserStateFindStartCode:
+			p.findStartCode(remain, &remain)
 
-		case stateParsePES:
-			//var bp []byte
+		case parserStateParsePSH:
+			p.parsePSH(remain, &remain)
+		case parserStateParsePSHStuffing:
+			if p.parsePSHStuffing(remain, &remain) {
+				return true, remain, nil
+			}
 
+		case parserStateParseSYS:
+			if _, err := p.parseSYS(remain, &remain); err != nil {
+				return false, remain, err
+			}
+		case parserStateParseSYSStreamInfos:
+			if p.parseSYSStreamInfos(remain, &remain) {
+				return true, remain, nil
+			}
+
+		case parserStateParsePSMPacketLength:
+			if _, err := p.parsePSMPacketLength(remain, &remain); err != nil {
+				return false, remain, err
+			}
+		case parserStateParsePSMHeader:
+			if ok, err := p.parsePSMHeader(remain, &remain); err != nil {
+				return false, remain, err
+			} else if ok {
+				return true, remain, nil
+			}
+
+		case parserStateParsePESPacketLength:
+			if _, err := p.parsePESPacketLength(remain, &remain); err != nil {
+				return false, remain, err
+			}
+		case parserStateParseHeaderDataLength:
+			if _, err := p.parsePESHeaderDataLength(remain, &remain); err != nil {
+				return false, remain, err
+			}
+		case parserStateParsePESHeader:
+			if _, err := p.parsePESHeader(remain, &remain); err != nil {
+				return false, remain, err
+			}
+		case parserStateParsePacketData:
+			if p.parsePESPacketData(remain, &remain) {
+				return true, remain, nil
+			}
 		}
 	}
 	return
+}
+
+func (p *Parser) ParseP(data []byte, remainP *[]byte) (ok bool, err error) {
+	ok, *remainP, err = p.Parse(data)
+	return
+}
+
+func (p *Parser) Pack() Pack {
+	switch p.startCode[3] {
+	case 0:
+		return nil
+	case 0xBA:
+		return p.psh
+	case 0xBB:
+		return p.sys
+	case StreamIdProgramStreamMap:
+		return p.psm
+	default:
+		return p.pes
+	}
 }

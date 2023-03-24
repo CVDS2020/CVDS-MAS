@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"gitee.com/sy_183/common/container"
 	"gitee.com/sy_183/common/def"
+	errors "gitee.com/sy_183/common/errors"
 	"gitee.com/sy_183/common/lifecycle"
 	"gitee.com/sy_183/common/lock"
 	"gitee.com/sy_183/common/log"
@@ -15,7 +15,6 @@ import (
 	"gitee.com/sy_183/cvds-mas/api/bean"
 	"gitee.com/sy_183/cvds-mas/config"
 	"gitee.com/sy_183/cvds-mas/db"
-	errPkg "gitee.com/sy_183/cvds-mas/errors"
 	gbErrors "gitee.com/sy_183/cvds-mas/gb28181/errors"
 	modelPkg "gitee.com/sy_183/cvds-mas/gb28181/model"
 	"gitee.com/sy_183/cvds-mas/gb28181/sip"
@@ -35,6 +34,8 @@ import (
 	"time"
 )
 
+const ChannelModule = Module + ".channel"
+
 type Channel struct {
 	lifecycle.Lifecycle
 	runner *lifecycle.DefaultLifecycle
@@ -45,6 +46,7 @@ type Channel struct {
 	storageConfigManager *StorageConfigManager
 	mcManager            *mediaChannel.Manager
 	mediaChannel         *mediaChannel.Channel
+	playSignal           chan struct{}
 
 	proxyConfig *config.GB28181Proxy
 
@@ -81,10 +83,15 @@ type MediaInfo struct {
 	RtpMap     map[uint8]string
 }
 
+type NPT struct {
+	Now bool
+	NPT float64
+}
+
 type MANSRTSP struct {
 	Method string
 	Scale  float64
-	Range  time.Time
+	Range  *NPT
 }
 
 func (r *MANSRTSP) Parse(raw []byte) error {
@@ -97,15 +104,14 @@ func (r *MANSRTSP) Parse(raw []byte) error {
 			case "PLAY", "PAUSE", "TEARDOWN":
 				r.Method = upMethod
 			default:
-				return errPkg.NewInvalidArgument("MANSRTSP.method", fmt.Errorf("无效的MANSRTSP方法(%s)", method))
+				return errors.NewInvalidArgument("MANSRTSP.method", fmt.Errorf("无效的MANSRTSP方法(%s)", method))
 			}
 		} else {
-			return errPkg.NewInvalidArgument("MANSRTSP.requestLine", errors.New("MANSRTSP请求行格式错误"))
+			return errors.NewInvalidArgument("MANSRTSP.requestLine", errors.New("MANSRTSP请求行格式错误"))
 		}
 	}
 
 	r.Scale = 0
-	r.Range = time.Time{}
 	for scanner.Scan() {
 		header := scanner.Text()
 		if tokens := strings.SplitN(header, ":", 2); len(tokens) == 2 {
@@ -114,23 +120,27 @@ func (r *MANSRTSP) Parse(raw []byte) error {
 			case "scale":
 				parsed, err := strconv.ParseFloat(value, 64)
 				if err != nil {
-					return errPkg.NewInvalidArgument("MANSRTSP.scale", err)
+					return errors.NewInvalidArgument("MANSRTSP.scale", err)
 				}
 				r.Scale = parsed
 			case "range":
-				if strings.HasPrefix(strings.ToLower(value), "ntp=") {
-					ntp := value[4:]
-					if i := strings.IndexByte(ntp, '-'); i > 0 {
-						parsed, err := strconv.ParseUint(ntp[:i], 10, 64)
-						if err != nil {
-							return errPkg.NewInvalidArgument("MANSRTSP.range.ntp", err)
+				if strings.HasPrefix(strings.ToLower(value), "npt=") {
+					npt := value[4:]
+					if i := strings.IndexByte(npt, '-'); i > 0 {
+						if npt[:i] == "now" {
+							r.Range = &NPT{Now: true}
+							continue
 						}
-						r.Range = sdp.NTPToTime(parsed)
+						parsed, err := strconv.ParseFloat(npt[:i], 64)
+						if err != nil {
+							return errors.NewInvalidArgument("MANSRTSP.range.npt", err)
+						}
+						r.Range = &NPT{NPT: parsed}
 					} else {
-						return errPkg.NewInvalidArgument("MANSRTSP.range.ntp", fmt.Errorf("无效的NTP范围(%s)", ntp))
+						return errors.NewInvalidArgument("MANSRTSP.range.npt", fmt.Errorf("无效的NPT范围(%s)", npt))
 					}
 				} else {
-					return errPkg.NewInvalidArgument("MANSRTSP.range", fmt.Errorf("无效的range(%s)", value))
+					return errors.NewInvalidArgument("MANSRTSP.range", fmt.Errorf("无效的range(%s)", value))
 				}
 			}
 		}
@@ -141,7 +151,7 @@ func (r *MANSRTSP) Parse(raw []byte) error {
 
 type PlaybackDialog struct {
 	channel *Channel
-	Pusher  *mediaChannel.HistoryRTPPusher
+	Pusher  *mediaChannel.HistoryRtpPusher
 
 	DialogId string
 	CallId   string
@@ -161,7 +171,7 @@ type PlaybackDialog struct {
 
 func newPlaybackDialog(channel *Channel, request *sip.Request) (*PlaybackDialog, error) {
 	if len(request.Via) == 0 {
-		return nil, errPkg.NewArgumentMissing("request.via")
+		return nil, errors.NewArgumentMissing("request.via")
 	}
 
 	var contactURI string
@@ -172,12 +182,12 @@ func newPlaybackDialog(channel *Channel, request *sip.Request) (*PlaybackDialog,
 	}
 
 	if contactURI == "" {
-		return nil, errPkg.NewArgumentMissing("request.contact")
+		return nil, errors.NewArgumentMissing("request.contact")
 	}
 
 	uri := sip.URI{}
 	if err := uri.Parse(contactURI); err != nil {
-		return nil, errPkg.NewInvalidArgument("request.contact.address.uri", err)
+		return nil, errors.NewInvalidArgument("request.contact.address.uri", err)
 	}
 
 	dialog := &PlaybackDialog{
@@ -206,7 +216,7 @@ func newPlaybackDialog(channel *Channel, request *sip.Request) (*PlaybackDialog,
 func (d *PlaybackDialog) createByeRequest() *sip.Request {
 	proxyConfig := d.channel.ProxyConfig()
 	return &sip.Request{
-		URI: sip.CreateSipURI(d.RemoteId, d.RemoteIp, int(d.RemotePort), ""),
+		URI: sip.CreateSipURI(d.RemoteId, d.RemoteIp, d.RemotePort, ""),
 		Message: sip.Message{
 			LocalIp:   proxyConfig.SipIp,
 			LocalPort: proxyConfig.SipPort,
@@ -220,7 +230,7 @@ func (d *PlaybackDialog) createByeRequest() *sip.Request {
 			To: sip.To{
 				Address: sip.Address{
 					DisplayName: d.RemoteDisplayName,
-					URI:         sip.CreateSipURI(d.RemoteId, d.RemoteIp, int(d.RemotePort), d.RemoteDomain),
+					URI:         sip.CreateSipURI(d.RemoteId, d.RemoteIp, d.RemotePort, d.RemoteDomain),
 				},
 				Tag: d.ToTag,
 			},
@@ -250,6 +260,7 @@ func newChannel(channel *modelPkg.Channel, manager *ChannelManager) *Channel {
 		dbManager:            GetDBManager(),
 		storageConfigManager: GetStorageConfigManager(),
 		mcManager:            mediaChannel.GetManager(),
+		playSignal:           make(chan struct{}, 1),
 		proxyConfig:          config.GB28181ProxyConfig(),
 		channel:              channel,
 	}
@@ -268,7 +279,7 @@ func (c *Channel) Model() *modelPkg.Channel {
 }
 
 func (c *Channel) DisplayName() string {
-	return fmt.Sprintf("国标通道服务(%s)", c.name)
+	return fmt.Sprintf("国标通道(%s)", c.name)
 }
 
 func (c *Channel) ProxyConfig() *config.GB28181Proxy {
@@ -299,12 +310,12 @@ func (c *Channel) enabledRtpMaps() (rtpMap []*sdp.RtpMap) {
 	mediaConfig := config.MediaConfig()
 	for _, typ := range mediaConfig.EnabledMediaTypes {
 		mediaType := media.ParseMediaType(typ)
-		if mediaType != nil && mediaType.ID < 128 {
-			rtpMap = append(rtpMap, sdp.NewRtpMap(int(mediaType.ID), mediaType.UpperName, 90000))
+		if mediaType != nil && mediaType.PT < 128 {
+			rtpMap = append(rtpMap, sdp.NewRtpMap(int(mediaType.PT), mediaType.EncodingName, mediaType.ClockRate))
 		}
 	}
 	if len(rtpMap) == 0 {
-		rtpMap = append(rtpMap, sdp.NewRtpMap(int(media.MediaTypePS.ID), media.MediaTypePS.UpperName, 90000))
+		rtpMap = append(rtpMap, sdp.NewRtpMap(int(media.MediaTypePS.PT), media.MediaTypePS.EncodingName, media.MediaTypePS.ClockRate))
 	}
 	return
 }
@@ -519,7 +530,7 @@ func (c *Channel) getCallInfo(action string) (gateway *modelPkg.Gateway, callIp 
 		model := new(modelPkg.Gateway)
 		if res := c.dbManager.Table(modelPkg.GatewayTableName).Where("name = ?", channel.Gateway).First(model); res.Error != nil {
 			if errors.Is(res.Error, gorm.ErrRecordNotFound) {
-				err = c.Logger().ErrorWith(action+"失败", &errPkg.NotFound{Target: "网关"},
+				err = c.Logger().ErrorWith(action+"失败", &errors.NotFound{Target: "网关"},
 					log.String("通道", channel.Name),
 					log.String("网关", channel.Gateway),
 				)
@@ -533,7 +544,7 @@ func (c *Channel) getCallInfo(action string) (gateway *modelPkg.Gateway, callIp 
 		}
 		gateway = model
 		if gateway.GatewayIp == "" {
-			err = c.Logger().ErrorWith(action+"失败", errPkg.NewArgumentMissing("gateway.gatewayIp"),
+			err = c.Logger().ErrorWith(action+"失败", errors.NewArgumentMissing("gateway.gatewayIp"),
 				log.String("网关", gateway.Name))
 			return
 		}
@@ -546,7 +557,7 @@ func (c *Channel) getCallInfo(action string) (gateway *modelPkg.Gateway, callIp 
 		callDomain = channel.ChannelDomain
 	} else {
 		err = c.Logger().ErrorWith(action+"失败",
-			errPkg.NewArgumentMissingOne("channel.channelIp", "channel.gateway"), log.String("通道", channel.Name))
+			errors.NewArgumentMissingOne("channel.channelIp", "channel.gateway"), log.String("通道", channel.Name))
 		return
 	}
 	transport = "udp"
@@ -571,7 +582,7 @@ func (c *Channel) sendRequest(method string, sipRequest *sip.Request) (*sip.Resp
 	}
 	response, err := http.Post(url, "application/json", bytes.NewReader(content))
 	if err != nil {
-		return nil, c.Logger().ErrorWith("发送HTTP请求失败", err)
+		return nil, c.Logger().ErrorWith("发送HTTP请求失败", err, log.String("url", url))
 	}
 	content, err = io.ReadAll(response.Body)
 	if err != nil {
@@ -586,7 +597,7 @@ func (c *Channel) sendRequest(method string, sipRequest *sip.Request) (*sip.Resp
 		if res.Err != nil {
 			fields = append(fields, log.Reflect("错误详细信息", res.Err))
 		}
-		return nil, c.Logger().ErrorWith("HTTP响应失败", &errPkg.HttpResponseError{Code: res.Code, Msg: res.Msg}, fields...)
+		return nil, c.Logger().ErrorWith("HTTP响应失败", &errors.HttpResponseError{Code: res.Code, Msg: res.Msg}, fields...)
 	}
 	c.Logger().Info("基于HTTP协议的SIP请求成功",
 		log.String("SIP请求方法", strings.ToUpper(method)),
@@ -596,14 +607,14 @@ func (c *Channel) sendRequest(method string, sipRequest *sip.Request) (*sip.Resp
 	return res.Data, nil
 }
 
-func (c *Channel) parseMessageSDP(message *sip.Message) (*MediaInfo, error) {
+func (c *Channel) parseMessageSDP(message *sip.Message) (*media.MediaInfo, error) {
 	if message.ContentType == "" || message.Content == "" {
 		return nil, c.Logger().ErrorWith("获取SIP消息体失败",
-			errPkg.NewArgumentMissing("message.contentType", "message.content"))
+			errors.NewArgumentMissing("message.contentType", "message.content"))
 	}
 	if strings.ToLower(message.ContentType) != "application/sdp" {
 		return nil, c.Logger().ErrorWith("获取SIP消息体失败",
-			errPkg.NewInvalidArgument("message.contentType", errors.New("响应类型必须为application/sdp")),
+			errors.NewInvalidArgument("message.contentType", errors.New("响应类型必须为application/sdp")),
 			log.String("响应类型", message.ContentType))
 	}
 
@@ -643,15 +654,15 @@ func (c *Channel) parseMessageSDP(message *sip.Message) (*MediaInfo, error) {
 	case "TCP/RTP/AVP":
 		transport = "tcp"
 	default:
-		return nil, c.Logger().ErrorWith("解析SDP中的传输协议失败", errPkg.NewInvalidArgument("protocol", errors.New("无效的传输协议")))
+		return nil, c.Logger().ErrorWith("解析SDP中的传输协议失败", errors.NewInvalidArgument("protocol", errors.New("无效的传输协议")))
 	}
 	if remotePort == 0 {
-		return nil, c.Logger().ErrorWith("获取SDP媒体信息失败", &errPkg.NotFound{Target: "实时视频流的端口信息"})
+		return nil, c.Logger().ErrorWith("获取SDP媒体信息失败", &errors.NotFound{Target: "实时视频流的端口信息"})
 	}
 	if remoteIp == nil {
 		remoteIp = sdpMessage.Connection.IP
 		if remoteIp == nil {
-			return nil, c.Logger().ErrorWith("获取SDP媒体信息失败", &errPkg.NotFound{Target: "实时视频流的IP信息"})
+			return nil, c.Logger().ErrorWith("获取SDP媒体信息失败", &errors.NotFound{Target: "实时视频流的IP信息"})
 		}
 	}
 	rtpMap := make(map[uint8]string)
@@ -667,7 +678,7 @@ func (c *Channel) parseMessageSDP(message *sip.Message) (*MediaInfo, error) {
 		}
 	}
 	if len(rtpMap) == 0 {
-		return nil, c.Logger().ErrorWith("获取SDP媒体信息失败", &errPkg.NotFound{Target: "实时视频流的格式信息"})
+		return nil, c.Logger().ErrorWith("获取SDP媒体信息失败", &errors.NotFound{Target: "实时视频流的格式信息"})
 	}
 	ssrc := int64(-1)
 	for _, line := range sdpSession {
@@ -679,7 +690,7 @@ func (c *Channel) parseMessageSDP(message *sip.Message) (*MediaInfo, error) {
 			ssrc = int64(parsed)
 		}
 	}
-	return &MediaInfo{
+	return &media.MediaInfo{
 		Name:       sdpMessage.Name,
 		Start:      start,
 		End:        end,
@@ -695,11 +706,11 @@ func (c *Channel) parseMessageSDP(message *sip.Message) (*MediaInfo, error) {
 func (c *Channel) parseMessageMANSRTSP(message *sip.Message) (*MANSRTSP, error) {
 	if message.ContentType == "" || message.Content == "" {
 		return nil, c.Logger().ErrorWith("获取SIP消息体失败",
-			errPkg.NewArgumentMissing("message.contentType", "message.content"))
+			errors.NewArgumentMissing("message.contentType", "message.content"))
 	}
 	if strings.ToLower(message.ContentType) != "application/mansrtsp" {
 		return nil, c.Logger().ErrorWith("获取SIP消息体失败",
-			errPkg.NewInvalidArgument("message.contentType", errors.New("响应类型必须为application/sdp")),
+			errors.NewInvalidArgument("message.contentType", errors.New("响应类型必须为application/sdp")),
 			log.String("响应类型", message.ContentType))
 	}
 
@@ -718,7 +729,7 @@ func (c *Channel) checkStream(stream *modelPkg.Stream) error {
 		stream.RemoteId == "" ||
 		stream.RemoteIp == "" ||
 		stream.Transport == "" {
-		return errPkg.NewArgumentMissing(
+		return errors.NewArgumentMissing(
 			"stream.callId",
 			"stream.fromTag",
 			"stream.toTag",
@@ -730,7 +741,7 @@ func (c *Channel) checkStream(stream *modelPkg.Stream) error {
 	switch strings.ToLower(stream.Transport) {
 	case "udp", "tcp":
 	default:
-		return errPkg.NewInvalidArgument("stream.transport", fmt.Errorf("无效的SIP传输协议(%s)", stream.Transport))
+		return errors.NewInvalidArgument("stream.transport", fmt.Errorf("无效的SIP传输协议(%s)", stream.Transport))
 	}
 	return nil
 }
@@ -738,11 +749,11 @@ func (c *Channel) checkStream(stream *modelPkg.Stream) error {
 func (c *Channel) createStream(response *sip.Response, remoteId string, remoteIp string, remotePort int, remoteDomain string, transport string) (*modelPkg.Stream, error) {
 	if response.CallId == "" || response.From.Tag == "" || response.To.Tag == "" {
 		return nil, c.Logger().ErrorWith("创建通道实时流失败",
-			errPkg.NewArgumentMissing("response.callId", "response.from.tag", "response.to.tag"))
+			errors.NewArgumentMissing("response.callId", "response.from.tag", "response.to.tag"))
 	}
 	if response.CSeq != 1 {
 		return nil, c.Logger().ErrorWith("创建通道实时流失败",
-			errPkg.NewInvalidArgument("response.cSeq", errors.New("SIP响应CSeq与请求不匹配")),
+			errors.NewInvalidArgument("response.cSeq", errors.New("SIP响应CSeq与请求不匹配")),
 			log.Uint32("请求CSeq", 1),
 			log.Uint32("响应CSeq", response.CSeq),
 		)
@@ -758,7 +769,7 @@ func (c *Channel) createStream(response *sip.Response, remoteId string, remoteIp
 	if contactURI != "" {
 		url := sip.URI{}
 		if err := url.Parse(contactURI); err != nil {
-			return nil, c.Logger().ErrorWith("创建通道实时流失败", errPkg.NewInvalidArgument("response.contact.address.uri", err))
+			return nil, c.Logger().ErrorWith("创建通道实时流失败", errors.NewInvalidArgument("response.contact.address.uri", err))
 		}
 		remoteId = url.User
 		remoteIp = url.Host
@@ -877,7 +888,7 @@ func (c *Channel) play(channel *modelPkg.Channel, checkStream bool) (err error) 
 	}
 
 	// 打开RTP拉流服务(获取本地的RTP服务IP和端口)
-	player, err := c.mediaChannel.OpenRTPPlayer(c.mediaTransport, time.Second*5, nil)
+	player, err := c.mediaChannel.OpenRtpPlayer(c.mediaTransport, time.Second*5, nil)
 	if err != nil {
 		return err
 	}
@@ -887,7 +898,7 @@ func (c *Channel) play(channel *modelPkg.Channel, checkStream bool) (err error) 
 	defer func() {
 		// RTP拉流服务已启动，出现错误需要关闭RTP拉流
 		if err != nil {
-			c.mediaChannel.CloseRTPPlayer()
+			c.mediaChannel.CloseRtpPlayer()
 		}
 	}()
 
@@ -970,7 +981,7 @@ func (c *Channel) checkStorage() error {
 				return err
 			}
 			if storageConfig == nil {
-				return c.Logger().ErrorWith("初始化通道失败", &errPkg.NotFound{Target: "存储配置"},
+				return c.Logger().ErrorWith("初始化通道失败", &errors.NotFound{Target: "存储配置"},
 					log.String("通道", c.name),
 					log.String("存储配置", channel.StorageConfig),
 				)
@@ -990,7 +1001,7 @@ func (c *Channel) checkStorage() error {
 
 func (c *Channel) checkPlayer() error {
 	if channel := c.channel; channel.EnableRecord {
-		if player := c.mediaChannel.GetRTPPlayer(); player == nil {
+		if player := c.mediaChannel.GetRtpPlayer(); player == nil {
 			return c.play(channel, true)
 		}
 	}
@@ -1007,7 +1018,7 @@ func (c *Channel) check() error {
 	return nil
 }
 
-func (c *Channel) processPlayback(request *sip.Request, mediaInfo *MediaInfo) *sip.Response {
+func (c *Channel) processPlayback(request *sip.Request, mediaInfo *media.MediaInfo) *sip.Response {
 	return lock.RLockGet(c.runner, func() *sip.Response {
 		if !c.runner.Running() {
 			return c.createResponse(request, responsePkg.TemporarilyUnavailable, "")
@@ -1042,9 +1053,9 @@ func (c *Channel) processPlayback(request *sip.Request, mediaInfo *MediaInfo) *s
 		}
 
 		// 创建历史音视频RTP推流服务
-		pusher, err := c.mediaChannel.OpenHistoryRTPPusher(mediaInfo.RemoteIP, mediaInfo.RemotePort, mediaInfo.Transport,
+		pusher, err := c.mediaChannel.OpenHistoryRtpPusher(mediaInfo.RemoteIP, mediaInfo.RemotePort, mediaInfo.Transport,
 			mediaInfo.Start.UnixMilli(), mediaInfo.End.UnixMilli(), mediaInfo.SSRC, nil,
-			func(pusher *mediaChannel.HistoryRTPPusher, channel *mediaChannel.Channel) {
+			func(pusher *mediaChannel.HistoryRtpPusher, channel *mediaChannel.Channel) {
 				dialog.byeOnce.Do(func() {
 					c.sendRequest("bye", dialog.createByeRequest())
 				})
@@ -1056,12 +1067,12 @@ func (c *Channel) processPlayback(request *sip.Request, mediaInfo *MediaInfo) *s
 		dialog.Pusher = pusher
 
 		if _, exist := c.playbackDialogs.LoadOrStore(dialog.DialogId, dialog); exist {
-			c.mediaChannel.CloseHistoryRTPPusher(pusher.ID())
+			c.mediaChannel.CloseHistoryRtpPusher(pusher.ID())
 			c.Logger().Error("对话已存在，不支持SIP re-INVITE请求", log.String("dialogId", dialog.DialogId))
 			return c.createResponse(request, responsePkg.BadRequest, dialog.ToTag)
 		}
 
-		mediaLocalIp := pusher.LocalIP()
+		mediaLocalIp := pusher.LocalIp()
 		mediaLocalPort := pusher.LocalPort()
 
 		// 构建SIP INVITE响应
@@ -1098,7 +1109,7 @@ func (c *Channel) ProcessProxyInvite(request *sip.Request) *sip.Response {
 func (c *Channel) ProcessProxyAck(request *sip.Request) {
 	dialogId := sip.CreateDialogId(request.CallId, request.From.Tag, request.To.Tag)
 	if dialog, exist := c.playbackDialogs.Load(dialogId); exist {
-		dialog.Pusher.Push()
+		dialog.Pusher.StartPush()
 	}
 }
 
@@ -1122,24 +1133,17 @@ func (c *Channel) ProcessProxyInfo(request *sip.Request) *sip.Response {
 		}
 		switch rtsp.Method {
 		case "PLAY":
-			if rtsp.Scale != 0 {
-				if rtsp.Scale > 8 || rtsp.Scale < 0.5 {
-					c.Logger().ErrorMsg("播放倍速超过了限制")
-					return c.createResponse(request, responsePkg.UnsupportedMediaType, dialog.ToTag)
-				}
-			}
-			if !rtsp.Range.IsZero() {
-				seek := rtsp.Range.UnixMilli()
-				if seek < dialog.Pusher.StartTime() || seek < dialog.Pusher.EndTime() {
-					c.Logger().ErrorMsg("播放时间超过了起始和结束的范围")
-					return c.createResponse(request, responsePkg.UnsupportedMediaType, dialog.ToTag)
-				}
-			}
+			//if rtsp.Scale != 0 {
+			//	if rtsp.Scale > 8 || rtsp.Scale < 0.5 {
+			//		c.Logger().ErrorMsg("播放倍速超过了限制")
+			//		return c.createResponse(request, responsePkg.UnsupportedMediaType, dialog.ToTag)
+			//	}
+			//}
 			if rtsp.Scale != 0 {
 				dialog.Pusher.SetScale(rtsp.Scale)
 			}
-			if !rtsp.Range.IsZero() {
-				dialog.Pusher.Seek(rtsp.Range.UnixMilli())
+			if rtsp.Range != nil && !rtsp.Range.Now {
+				dialog.Pusher.Seek(int64(rtsp.Range.NPT * 1000))
 			}
 			dialog.Pusher.Resume()
 		case "PAUSE":
@@ -1172,7 +1176,7 @@ func (c *Channel) ProcessBye(request *sip.Request) *sip.Response {
 		return nil
 	}); stream != nil {
 		c.Logger().Info("BYE请求关闭通道实时流成功")
-		c.mediaChannel.CloseRTPPlayer()
+		c.mediaChannel.CloseRtpPlayer()
 		c.deleteStream(stream)
 		return c.createResponse(request, responsePkg.Ok, "")
 	}
@@ -1183,11 +1187,11 @@ func (c *Channel) ProcessBye(request *sip.Request) *sip.Response {
 func (c *Channel) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
 	channel := c.channel
 	if channel.ChannelId == "" {
-		return c.Logger().ErrorWith("初始化通道失败", errPkg.NewArgumentMissing("channel.channelId"))
+		return c.Logger().ErrorWith("初始化通道失败", errors.NewArgumentMissing("channel.channelId"))
 	}
 	if channel.ChannelIp == "" && channel.Gateway == "" {
 		return c.Logger().ErrorWith("初始化通道失败",
-			errPkg.NewArgumentMissingOne("channel.channelIp", "channel.gateway"), log.String("通道", channel.Name))
+			errors.NewArgumentMissingOne("channel.channelIp", "channel.gateway"), log.String("通道", channel.Name))
 	}
 
 	switch strings.ToUpper(channel.StreamMode) {
@@ -1196,17 +1200,17 @@ func (c *Channel) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error 
 		c.mediaProtocol = "RTP/AVP"
 	case "TCP-ACTIVE":
 		return c.Logger().ErrorWith("初始化通道失败",
-			errPkg.NewInvalidArgument("channel.streamMode", errors.New("暂不支持TCP主动模式")))
+			errors.NewInvalidArgument("channel.streamMode", errors.New("暂不支持TCP主动模式")))
 	case "TCP-PASSIVE":
 		c.mediaTransport = "tcp"
 		c.mediaProtocol = "TCP/RTP/AVP"
 	default:
 		return c.Logger().ErrorWith("初始化通道失败",
-			errPkg.NewInvalidArgument("channel.streamMode", fmt.Errorf("错误的流模式(%s)", channel.StreamMode)))
+			errors.NewInvalidArgument("channel.streamMode", fmt.Errorf("错误的流模式(%s)", channel.StreamMode)))
 	}
 
 	// 创建媒体通道
-	mc, err := c.mcManager.Create(c.name, make(map[string]any))
+	mc, err := c.mcManager.Create(c.name)
 	if err != nil {
 		return err
 	}

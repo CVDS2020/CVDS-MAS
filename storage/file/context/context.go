@@ -82,8 +82,8 @@ func OpenFile(req *OpenRequest) *OpenResponse {
 
 	// 打开文件
 	fp, err := os.OpenFile(req.File, req.Flag, 0644)
-	if err != nil && flagPkg.TestFlag(req.Flag, os.O_CREATE) && os.IsNotExist(err) {
-		if err = os.MkdirAll(path.Dir(req.File), 0644); err == nil {
+	if err != nil && flagPkg.TestFlag(req.Flag, os.O_CREATE) {
+		if err = os.MkdirAll(path.Dir(req.File), 0755); err == nil {
 			fp, err = os.OpenFile(req.File, req.Flag, 0644)
 		}
 	}
@@ -170,7 +170,7 @@ func (c *Context) Write(req *WriteRequest) *WriteResponse {
 	}()
 
 	if c.fp == nil {
-		panic(fmt.Errorf("file(%s) has been closed", c.file))
+		panic(fmt.Errorf("文件(%s)已经被关闭", c.file))
 	}
 
 	res.FileInfo = c.info
@@ -204,6 +204,7 @@ func (c *Context) Write(req *WriteRequest) *WriteResponse {
 			if c.offset > c.size {
 				c.size = c.offset
 			}
+			res.Offset = c.offset
 			res.Size = int64(n)
 		}
 		if err != nil {

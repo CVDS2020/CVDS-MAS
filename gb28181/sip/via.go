@@ -2,7 +2,7 @@ package sip
 
 import (
 	"fmt"
-	errPkg "gitee.com/sy_183/cvds-mas/errors"
+	"gitee.com/sy_183/common/errors"
 	"strings"
 )
 
@@ -22,14 +22,14 @@ type Via struct {
 
 func (v *Via) Check() error {
 	if v.Host == "" || v.Transport == "" || v.Branch == "" {
-		return errPkg.NewArgumentMissing("via.host", "via.transport", "via.branch")
+		return errors.NewArgumentMissing("via.host", "via.transport", "via.branch")
 	}
 
 	switch strings.ToLower(v.Transport) {
 	case "udp":
 	case "tcp":
 	default:
-		return errPkg.NewInvalidArgument("via.transport", fmt.Errorf("无效的传输协议(%s)", v.Transport))
+		return errors.NewInvalidArgument("via.transport", fmt.Errorf("无效的传输协议(%s)", v.Transport))
 	}
 
 	return nil

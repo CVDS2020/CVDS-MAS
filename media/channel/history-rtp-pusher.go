@@ -7,7 +7,7 @@ import (
 	timerPkg "gitee.com/sy_183/common/timer"
 	"gitee.com/sy_183/common/utils"
 	"gitee.com/sy_183/cvds-mas/storage"
-	framePkg "gitee.com/sy_183/rtp/frame"
+	rtpFrame "gitee.com/sy_183/rtp/frame"
 	"gitee.com/sy_183/rtp/rtp"
 	rtpServer "gitee.com/sy_183/rtp/server"
 	"io"
@@ -23,8 +23,8 @@ import (
 const findIndexesLimit = 64
 
 type (
-	HistoryRTPPusherEOFCallback    func(pusher *HistoryRTPPusher, channel *Channel)
-	HistoryRTPPusherClosedCallback func(pusher *HistoryRTPPusher, channel *Channel)
+	HistoryRtpPusherEOFCallback    func(pusher *HistoryRtpPusher, channel *Channel)
+	HistoryRtpPusherClosedCallback func(pusher *HistoryRtpPusher, channel *Channel)
 )
 
 type indexesFindRequest struct {
@@ -99,7 +99,7 @@ func (g *indexGetter) indexesFinderRun(_ lifecycle.Lifecycle, interrupter chan s
 
 // getCurIndex 从 curIndexes 中获取当前位置的索引，并将当前位置加一
 func (g *indexGetter) getCurIndex() storage.Index {
-	index := g.curIndexes.Get(g.curIndex).CloneIndex()
+	index := g.curIndexes.Get(g.curIndex).Clone()
 	g.curIndex++
 	return index
 }
@@ -108,7 +108,7 @@ func (g *indexGetter) getCurIndex() storage.Index {
 func (g *indexGetter) nextStartTime() int64 {
 	startTime := g.curTime
 	if l := g.curIndexes.Len(); l > 0 {
-		startTime = g.curIndexes.Get(l - 1).EndTime()
+		startTime = g.curIndexes.Get(l - 1).End()
 	}
 	return startTime
 }
@@ -156,15 +156,15 @@ func (g *indexGetter) getAfterLoadedFrom(startTime int64) (storage.Index, error)
 	} else {
 		first := g.curIndexes.Get(0)
 		last := g.curIndexes.Get(l - 1)
-		firstStart := first.StartTime()
+		firstStart := first.Start()
 		if g.curResponse.request.start < firstStart {
 			firstStart = g.curResponse.request.start
 		}
-		if startTime >= firstStart && startTime < last.EndTime() {
+		if startTime >= firstStart && startTime < last.End() {
 			g.curResponse.request.start = startTime
 			g.curTime = startTime
 			g.curIndex = sort.Search(l, func(i int) bool {
-				return g.curIndexes.Get(i).EndTime() > startTime
+				return g.curIndexes.Get(i).End() > startTime
 			})
 			g.load(g.nextStartTime())
 			return g.getCurIndex(), nil
@@ -276,8 +276,8 @@ func newBlockGetter(channel storage.Channel, indexGetter *indexGetter, readSessi
 		storageChannel: channel,
 		indexGetter:    indexGetter,
 
-		curBlock: make([]byte, channel.MaxBlockSize()),
-		blockBuf: make([]byte, channel.MaxBlockSize()),
+		curBlock: make([]byte, channel.WriteBufferSize()),
+		blockBuf: make([]byte, channel.WriteBufferSize()),
 
 		readSession:      readSession,
 		readRequestChan:  make(chan storage.Index, 1),
@@ -292,7 +292,7 @@ func (g *blockGetter) blockReaderRun(_ lifecycle.Lifecycle, interrupter chan str
 		select {
 		case index := <-g.readRequestChan:
 			var buf []byte
-			if size := index.DataSize(); size > uint64(cap(g.blockBuf)) {
+			if size := index.Size(); size > uint64(cap(g.blockBuf)) {
 				buf = make([]byte, size)
 			} else {
 				buf = g.blockBuf[:size]
@@ -319,14 +319,14 @@ func (g *blockGetter) readNext() (storage.Index, []byte, error) {
 		g.blockReading = false
 		return nil, nil, err
 	}
-	if g.curBlockSeq == index.Sequence() {
+	if g.curBlockSeq == index.Seq() {
 		// 由于 seek 的原因，获取到的索引与当前 block 的索引一致，提前获取下一个索引
 		// 并请求读取对应的 block
 		g.readNext()
 		return index, g.curBlock, nil
 	}
 	g.getIndexErr = nil
-	g.nextBlockSeq = index.Sequence()
+	g.nextBlockSeq = index.Seq()
 	g.readRequestChan <- index
 	g.blockReading = true
 	return index, nil, nil
@@ -339,7 +339,7 @@ func (g *blockGetter) getAfterRead() ([]byte, error) {
 		g.readNext()
 		return nil, res.err
 	}
-	g.curBlockSeq = res.request.Sequence()
+	g.curBlockSeq = res.request.Seq()
 	g.curBlock, g.blockBuf = res.data, g.curBlock[:cap(g.curBlock)]
 	g.readNext()
 	return g.curBlock, nil
@@ -350,16 +350,16 @@ func (g *blockGetter) getAfterRead() ([]byte, error) {
 func (g *blockGetter) getAfterReadFrom(index storage.Index) ([]byte, error) {
 	res := <-g.readResponseChan
 	if res.err != nil {
-		if res.request.Sequence() == index.Sequence() {
+		if res.request.Seq() == index.Seq() {
 			g.readNext()
 			return nil, res.err
 		} else {
 			return g.get(index)
 		}
 	}
-	g.curBlockSeq = res.request.Sequence()
+	g.curBlockSeq = res.request.Seq()
 	g.curBlock, g.blockBuf = res.data, g.curBlock[:cap(g.curBlock)]
-	if g.curBlockSeq == index.Sequence() {
+	if g.curBlockSeq == index.Seq() {
 		g.readNext()
 		return g.curBlock, nil
 	}
@@ -427,7 +427,7 @@ func (g *blockGetter) Seek(t int64) {
 	g.eof = false
 }
 
-type HistoryRTPPusher struct {
+type HistoryRtpPusher struct {
 	lifecycle.Lifecycle
 	runner *lifecycle.DefaultLifecycle
 
@@ -436,9 +436,9 @@ type HistoryRTPPusher struct {
 	storageChannel storage.Channel
 
 	transport  string
-	localIP    net.IP
+	localIp    net.IP
 	localPort  int
-	remoteIP   net.IP
+	remoteIp   net.IP
 	remotePort int
 	ssrc       uint32
 
@@ -458,14 +458,14 @@ type HistoryRTPPusher struct {
 	resumeSignal chan struct{}
 	scale        atomic.Uint64
 
-	eofCallback HistoryRTPPusherEOFCallback
+	eofCallback HistoryRtpPusherEOFCallback
 
 	log.AtomicLogger
 }
 
-func NewHistoryRTPPusher(id uint64, channel *Channel, remoteIP net.IP, remotePort int, transport string, startTime, endTime int64, ssrc int64,
-	eofCallback HistoryRTPPusherEOFCallback) (*HistoryRTPPusher, error) {
-	storageChannel := channel.loadStorageChannel()
+func NewHistoryRtpPusher(id uint64, channel *Channel, remoteIp net.IP, remotePort int, transport string, startTime, endTime int64, ssrc int64,
+	eofCallback HistoryRtpPusherEOFCallback) (*HistoryRtpPusher, error) {
+	storageChannel := channel.StorageChannel()
 	if storageChannel == nil {
 		return nil, StorageChannelNotSetupError
 	}
@@ -475,8 +475,8 @@ func NewHistoryRTPPusher(id uint64, channel *Channel, remoteIP net.IP, remotePor
 		return nil, err
 	}
 
-	if ipv4 := remoteIP.To4(); ipv4 != nil {
-		remoteIP = ipv4
+	if ipv4 := remoteIp.To4(); ipv4 != nil {
+		remoteIp = ipv4
 	}
 
 	switch strings.ToLower(transport) {
@@ -493,7 +493,7 @@ func NewHistoryRTPPusher(id uint64, channel *Channel, remoteIP net.IP, remotePor
 	switch transport {
 	case "tcp":
 		conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-			IP:   remoteIP,
+			IP:   remoteIp,
 			Port: remotePort,
 		})
 		if err != nil {
@@ -510,7 +510,7 @@ func NewHistoryRTPPusher(id uint64, channel *Channel, remoteIP net.IP, remotePor
 		localPort = localAddr.Port
 	case "udp":
 		conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
-			IP:   remoteIP,
+			IP:   remoteIp,
 			Port: remotePort,
 		})
 		if err != nil {
@@ -527,17 +527,16 @@ func NewHistoryRTPPusher(id uint64, channel *Channel, remoteIP net.IP, remotePor
 		localPort = localAddr.Port
 	}
 
-	p := &HistoryRTPPusher{
+	p := &HistoryRtpPusher{
 		id:             id,
 		channel:        channel,
 		storageChannel: storageChannel,
 
 		transport:  transport,
-		localIP:    localIp,
+		localIp:    localIp,
 		localPort:  localPort,
-		remoteIP:   remoteIP,
+		remoteIp:   remoteIp,
 		remotePort: remotePort,
-		ssrc:       rand.Uint32(),
 
 		tcpConn: tcpConn,
 		udpConn: udpConn,
@@ -571,48 +570,48 @@ func NewHistoryRTPPusher(id uint64, channel *Channel, remoteIP net.IP, remotePor
 	return p, nil
 }
 
-func (p *HistoryRTPPusher) DisplayName() string {
-	return p.channel.HistoryRTPPlayerDisplayName(p.id)
+func (p *HistoryRtpPusher) DisplayName() string {
+	return p.channel.HistoryRtpPlayerDisplayName(p.id)
 }
 
-func (p *HistoryRTPPusher) ID() uint64 {
+func (p *HistoryRtpPusher) ID() uint64 {
 	return p.id
 }
 
-func (p *HistoryRTPPusher) LocalIP() net.IP {
-	return p.localIP
+func (p *HistoryRtpPusher) LocalIp() net.IP {
+	return p.localIp
 }
 
-func (p *HistoryRTPPusher) LocalPort() int {
+func (p *HistoryRtpPusher) LocalPort() int {
 	return p.localPort
 }
 
-func (p *HistoryRTPPusher) RemoteIP() net.IP {
-	return p.remoteIP
+func (p *HistoryRtpPusher) RemoteIp() net.IP {
+	return p.remoteIp
 }
 
-func (p *HistoryRTPPusher) RemotePort() int {
+func (p *HistoryRtpPusher) RemotePort() int {
 	return p.remotePort
 }
 
-func (p *HistoryRTPPusher) SSRC() uint32 {
+func (p *HistoryRtpPusher) SSRC() uint32 {
 	return p.ssrc
 }
 
-func (p *HistoryRTPPusher) StartTime() int64 {
+func (p *HistoryRtpPusher) StartTime() int64 {
 	return p.startTime
 }
 
-func (p *HistoryRTPPusher) EndTime() int64 {
+func (p *HistoryRtpPusher) EndTime() int64 {
 	return p.endTime
 }
 
-func (p *HistoryRTPPusher) Info() map[string]any {
+func (p *HistoryRtpPusher) Info() map[string]any {
 	return map[string]any{
 		"pusherId":   p.ID(),
-		"localIp":    p.LocalIP(),
+		"localIp":    p.LocalIp(),
 		"localPort":  p.LocalPort(),
-		"remoteIp":   p.RemoteIP(),
+		"remoteIp":   p.RemoteIp(),
 		"remotePort": p.RemotePort(),
 		"ssrc":       p.SSRC(),
 		"startTime":  p.StartTime(),
@@ -621,7 +620,7 @@ func (p *HistoryRTPPusher) Info() map[string]any {
 	}
 }
 
-func (p *HistoryRTPPusher) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+func (p *HistoryRtpPusher) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
 	for {
 		select {
 		case <-p.pushSignal:
@@ -640,7 +639,7 @@ func (p *HistoryRTPPusher) start(_ lifecycle.Lifecycle, interrupter chan struct{
 	}
 }
 
-func (p *HistoryRTPPusher) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+func (p *HistoryRtpPusher) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
 	autoEOFCallback := true
 
 	defer func() {
@@ -661,7 +660,7 @@ func (p *HistoryRTPPusher) run(_ lifecycle.Lifecycle, interrupter chan struct{})
 	var seq uint16
 	var timestamp, interval time.Duration
 	var writeBuffer = bytes.Buffer{}
-	var readKeepChooser = rtpServer.NewDefaultKeepChooser(5, 5)
+	var readKeepChooser = rtpServer.NewDefaultKeepChooser(5, 5, nil)
 
 	var sendSignal = make(chan struct{}, 1)
 	var sendTimer = timerPkg.NewTimer(sendSignal)
@@ -704,38 +703,38 @@ seek:
 		}
 		readKeepChooser.OnSuccess()
 
-		frameLayer := framePkg.Layer{}
-		rtpParser := rtp.Parser{Layer: rtp.NewLayer()}
+		frame := rtpFrame.NewFrame()
+		rtpParser := rtp.Parser{Layer: rtp.NewIncomingLayer()}
 
-		send := func() error {
+		send := func() (err error) {
+			defer writeBuffer.Reset()
 			if p.udpConn != nil {
-				for _, layer := range frameLayer.RTPLayers {
-					layer.WriteTo(&writeBuffer)
-					if _, err := p.udpConn.Write(writeBuffer.Bytes()); err != nil {
+				frame.Range(func(i int, packet rtp.Packet) bool {
+					packet.WriteTo(&writeBuffer)
+					if _, err = p.udpConn.Write(writeBuffer.Bytes()); err != nil {
 						p.Logger().ErrorWith("发送基于UDP传输的RTP数据失败", err)
-						return err
+						return false
 					}
-					writeBuffer.Reset()
-				}
+					return true
+				})
 			} else {
-				framePkg.FullLayerWriter{Layer: &frameLayer}.WriteTo(&writeBuffer)
-				if _, err := p.tcpConn.Write(writeBuffer.Bytes()); err != nil {
+				rtpFrame.NewFullFrameWriter(frame).WriteTo(&writeBuffer)
+				if _, err = p.tcpConn.Write(writeBuffer.Bytes()); err != nil {
 					p.Logger().ErrorWith("发送基于TCP传输的RTP数据失败", err)
 					return err
 				}
-				writeBuffer.Reset()
 			}
-			frameLayer.Clear()
+			frame.Clear()
 			interval = 3600 * time.Second / time.Duration(90000*p.Scale())
 			timestamp += interval
 			return nil
 		}
 
-		rtpParseKeepChooser := rtpServer.NewDefaultKeepChooser(5, 5)
+		rtpParseKeepChooser := rtpServer.NewDefaultKeepChooser(5, 5, nil)
 
 		for len(block) > 0 {
 			if rtpParser.Layer == nil {
-				rtpParser.Layer = rtp.NewLayer()
+				rtpParser.Layer = rtp.NewIncomingLayer()
 			}
 			ok, remain, err := rtpParser.Parse(block)
 			block = remain
@@ -754,12 +753,10 @@ seek:
 				layer.SetSequenceNumber(seq)
 				layer.SetSSRC(p.ssrc)
 				seq++
-				if frameLayer.Len() == 0 || layer.Timestamp() == frameLayer.Timestamp {
-					frameLayer.Append(layer)
+				if frame.Len() == 0 || layer.Timestamp() == frame.Timestamp() {
+					frame.Append(rtp.NewPacket(layer, nil))
 				} else {
-					for _, layer := range frameLayer.RTPLayers {
-						layer.SetTimestamp(uint32(timestamp * 90000 / time.Second))
-					}
+					frame.SetTimestamp(uint32(timestamp * 90000 / time.Second))
 				waitSend:
 					for {
 						select {
@@ -797,15 +794,13 @@ seek:
 						// 网络错误，直接关闭推流
 						return err
 					}
-					frameLayer.Append(layer)
+					frame.Append(rtp.NewPacket(layer, nil))
 				}
 			}
 		}
 
-		if frameLayer.Len() > 0 {
-			for _, layer := range frameLayer.RTPLayers {
-				layer.SetTimestamp(uint32(timestamp * 90000 / time.Second))
-			}
+		if frame.Len() > 0 {
+			frame.SetTimestamp(uint32(timestamp * 90000 / time.Second))
 			if err := send(); err != nil {
 				// 网络错误，直接关闭推流
 				return err
@@ -814,41 +809,44 @@ seek:
 	}
 }
 
-func (p *HistoryRTPPusher) Push() {
+func (p *HistoryRtpPusher) StartPush() {
 	if !utils.ChanTryPush(p.pushSignal, struct{}{}) {
 		p.Logger().Warn("开始推流信号繁忙")
 	}
 }
 
-func (p *HistoryRTPPusher) Pause() {
+func (p *HistoryRtpPusher) Pause() {
 	if !utils.ChanTryPush(p.pauseSignal, struct{}{}) {
 		p.Logger().Warn("暂停信号繁忙")
 	}
 }
 
-func (p *HistoryRTPPusher) Resume() {
+func (p *HistoryRtpPusher) Resume() {
 	if !utils.ChanTryPush(p.resumeSignal, struct{}{}) {
 		p.Logger().Warn("恢复信号繁忙")
 	}
 }
 
-func (p *HistoryRTPPusher) Seek(t int64) error {
-	if t < p.startTime || t > p.endTime {
-		return p.Logger().ErrorMsg("播放时间超过了起始和结束的范围")
+func (p *HistoryRtpPusher) Seek(t int64) error {
+	if t < 0 {
+		t = 0
 	}
-	if !utils.ChanTryPush(p.seekSignal, t) {
+	if p.startTime+t > p.endTime {
+		t = p.endTime - p.startTime
+	}
+	if !utils.ChanTryPush(p.seekSignal, p.startTime+t) {
 		p.Logger().Warn("定位信号繁忙")
 	}
 	return nil
 }
 
-func (p *HistoryRTPPusher) Scale() float64 {
+func (p *HistoryRtpPusher) Scale() float64 {
 	scaleU := p.scale.Load()
 	return *(*float64)(unsafe.Pointer(&scaleU))
 }
 
-func (p *HistoryRTPPusher) SetScale(scale float64) error {
-	if scale > 8 || scale < 0.5 {
+func (p *HistoryRtpPusher) SetScale(scale float64) error {
+	if scale > 8 || scale < 0.1 {
 		return p.Logger().ErrorMsg("播放倍速超过了限制")
 	}
 	p.scale.Store(*(*uint64)(unsafe.Pointer(&scale)))

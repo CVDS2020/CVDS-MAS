@@ -6,13 +6,13 @@ import (
 	"gitee.com/sy_183/common/assert"
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/common/uns"
-	defaultLogger "gitee.com/sy_183/cvds-mas/logger"
+	"gitee.com/sy_183/cvds-mas/config"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
-var logger = defaultLogger.Logger()
+var logger = config.DefaultLogger()
 
 func main() {
 	hmap, err := syscall.CreateFileMapping(syscall.InvalidHandle, nil, syscall.PAGE_READWRITE, 0, 4096, assert.Must(syscall.UTF16PtrFromString("mem_test")))

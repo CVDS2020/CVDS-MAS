@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"gitee.com/sy_183/common/component"
+	"gitee.com/sy_183/common/errors"
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/cvds-mas/config"
 	mediaChannel "gitee.com/sy_183/cvds-mas/media/channel"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	MediaChannelModule     = "api.media-channel"
+	MediaChannelModule     = Module + ".media-channel"
 	MediaChannelModuleName = "媒体通道管理器API服务"
 )
 
@@ -73,6 +74,7 @@ func (c *MediaChannel) Create(ctx *gin.Context) {
 	model := struct {
 		ID           string         `json:"id"`
 		StorageCover uint           `json:"storageCover"`
+		StorageType  string         `json:"storageType"`
 		Fields       map[string]any `json:"fields"`
 	}{}
 
@@ -86,7 +88,15 @@ func (c *MediaChannel) Create(ctx *gin.Context) {
 		return
 	}
 
-	ch, err := c.manager.Create(model.ID, model.Fields)
+	var options []mediaChannel.Option
+	if model.Fields != nil {
+		options = append(options, mediaChannel.WithFields(model.Fields))
+	}
+	if model.StorageType != "" {
+		options = append(options, mediaChannel.WithStorageType(model.StorageType))
+	}
+
+	ch, err := c.manager.Create(model.ID, options...)
 	if err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
@@ -103,8 +113,7 @@ func (c *MediaChannel) Get(ctx *gin.Context) {
 
 	ch := c.manager.Get(id)
 	if ch == nil {
-		err := &mediaChannel.ChannelNotFoundError{ID: id}
-		responseErrorMsg(ctx, err.Error(), true)
+		responseErrorMsg(ctx, errors.NewNotFound(c.manager.ChannelDisplayName(id)).Error(), true)
 		return
 	}
 
@@ -133,20 +142,15 @@ func (c *MediaChannel) Modify(ctx *gin.Context) {
 
 	ch := c.manager.Get(model.ID)
 	if ch == nil {
-		err := &mediaChannel.ChannelNotFoundError{ID: model.ID}
-		responseErrorMsg(ctx, err.Error(), false)
+		responseErrorMsg(ctx, errors.NewNotFound(c.manager.ChannelDisplayName(model.ID)).Error(), false)
 		return
 	}
 
-	var modified = make([]string, 0)
 	for name, value := range model.Fields {
-		if ch.ModifyField(name, value) {
-			modified = append(modified, name)
-		}
+		ch.SetField(name, value)
 	}
 	responseSuccess(ctx, gin.H{
-		"modified": modified,
-		"channel":  ch.Info(),
+		"channel": ch.Info(),
 	})
 }
 
@@ -163,9 +167,9 @@ func (c *MediaChannel) Delete(ctx *gin.Context) {
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) OpenRTPPlayer(ctx *gin.Context) {
+func (c *MediaChannel) OpenRtpPlayer(ctx *gin.Context) {
 	model := struct {
-		ChannelID  string        `json:"channelId"`
+		ChannelId  string        `json:"channelId"`
 		Transport  string        `json:"transport"`
 		Timeout    time.Duration `json:"timeout"`
 		ClosedHook string        `json:"closedHook"`
@@ -182,12 +186,12 @@ func (c *MediaChannel) OpenRTPPlayer(ctx *gin.Context) {
 		return
 	}
 
-	if model.ChannelID == "" {
+	if model.ChannelId == "" {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId)", true)
 		return
 	}
 
-	player, err := c.manager.OpenRTPPlayer(model.ChannelID, model.Transport, model.Timeout, func(player *mediaChannel.RTPPlayer, channel *mediaChannel.Channel) {
+	player, err := c.manager.OpenRtpPlayer(model.ChannelId, model.Transport, model.Timeout, func(player *mediaChannel.RtpPlayer, channel *mediaChannel.Channel) {
 		if closedHookURL != nil {
 			c.notify(closedHookURL.String(), gin.H{
 				"channelId": channel.ID(),
@@ -201,9 +205,9 @@ func (c *MediaChannel) OpenRTPPlayer(ctx *gin.Context) {
 	responseSuccess(ctx, player.Info())
 }
 
-func (c *MediaChannel) SetupRTPPlayer(ctx *gin.Context) {
+func (c *MediaChannel) SetupRtpPlayer(ctx *gin.Context) {
 	model := struct {
-		ChannelID  string           `json:"channelId"`
+		ChannelId  string           `json:"channelId"`
 		RTPMap     map[uint8]string `json:"rtpMap"`
 		RemoteIP   net.IP           `json:"remoteIp"`
 		RemotePort int              `json:"remotePort"`
@@ -221,7 +225,7 @@ func (c *MediaChannel) SetupRTPPlayer(ctx *gin.Context) {
 		ctx.Abort()
 	}
 
-	if model.ChannelID == "" || model.RemoteIP == nil || model.RemotePort == 0 {
+	if model.ChannelId == "" || model.RemoteIP == nil || model.RemotePort == 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,mediaType,remoteIp,remotePort)", true)
 		return
 	}
@@ -231,41 +235,41 @@ func (c *MediaChannel) SetupRTPPlayer(ctx *gin.Context) {
 		ssrc = int64(*model.SSRC)
 	}
 
-	if err := c.manager.SetupRTPPlayer(model.ChannelID, model.RTPMap, model.RemoteIP, model.RemotePort, ssrc, model.Once); err != nil {
+	if err := c.manager.SetupRtpPlayer(model.ChannelId, model.RTPMap, model.RemoteIP, model.RemotePort, ssrc, model.Once); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) GetRTPPlayer(ctx *gin.Context) {
-	channelID := ctx.Query("channelId")
-	if channelID == "" {
+func (c *MediaChannel) GetRtpPlayer(ctx *gin.Context) {
+	channelId := ctx.Query("channelId")
+	if channelId == "" {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId)", true)
 		return
 	}
 
-	player, err := c.manager.GetRTPPlayer(channelID)
+	player, err := c.manager.GetRtpPlayer(channelId)
 	if err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	if player == nil {
-		err = &mediaChannel.RTPPlayerNotOpenedError{ChannelID: channelID}
+		err = &mediaChannel.RTPPlayerNotOpenedError{ChannelID: channelId}
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, player.Info())
 }
 
-func (c *MediaChannel) CloseRTPPlayer(ctx *gin.Context) {
-	channelID := ctx.Query("channelId")
-	if channelID == "" {
+func (c *MediaChannel) CloseRtpPlayer(ctx *gin.Context) {
+	channelId := ctx.Query("channelId")
+	if channelId == "" {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId)", true)
 		return
 	}
 
-	if waiter, err := c.manager.CloseRTPPlayer(channelID); err != nil {
+	if waiter, err := c.manager.CloseRtpPlayer(channelId); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	} else if waiter != nil {
@@ -274,17 +278,17 @@ func (c *MediaChannel) CloseRTPPlayer(ctx *gin.Context) {
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) OpenRTSPPlayer(ctx *gin.Context) {
+func (c *MediaChannel) OpenRtspPlayer(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持RTSP功能", true)
 }
 
-func (c *MediaChannel) CloseRTSPPlayer(ctx *gin.Context) {
+func (c *MediaChannel) CloseRtspPlayer(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持RTSP功能", true)
 }
 
 func (c *MediaChannel) SetupStorage(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `json:"channelId"`
+		ChannelId string `json:"channelId"`
 		Cover     int64  `json:"cover"`
 	}{}
 
@@ -293,7 +297,7 @@ func (c *MediaChannel) SetupStorage(ctx *gin.Context) {
 		return
 	}
 
-	if err := c.manager.SetupStorage(model.ChannelID, time.Duration(model.Cover)*time.Minute); err != nil {
+	if err := c.manager.SetupStorage(model.ChannelId, time.Duration(model.Cover)*time.Minute); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
@@ -301,13 +305,13 @@ func (c *MediaChannel) SetupStorage(ctx *gin.Context) {
 }
 
 func (c *MediaChannel) CloseStorage(ctx *gin.Context) {
-	channelID := ctx.Query("channelId")
-	if channelID == "" {
+	channelId := ctx.Query("channelId")
+	if channelId == "" {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId)", true)
 		return
 	}
 
-	if waiter, err := c.manager.StopStorage(channelID); err != nil {
+	if waiter, err := c.manager.StopStorage(channelId); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	} else if waiter != nil {
@@ -317,13 +321,13 @@ func (c *MediaChannel) CloseStorage(ctx *gin.Context) {
 }
 
 func (c *MediaChannel) StartRecord(ctx *gin.Context) {
-	channelID := ctx.Query("channelId")
-	if channelID == "" {
+	channelId := ctx.Query("channelId")
+	if channelId == "" {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId)", true)
 		return
 	}
 
-	if err := c.manager.StartRecord(channelID); err != nil {
+	if err := c.manager.StartRecord(channelId); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
@@ -331,23 +335,23 @@ func (c *MediaChannel) StartRecord(ctx *gin.Context) {
 }
 
 func (c *MediaChannel) StopRecord(ctx *gin.Context) {
-	channelID := ctx.Query("channelId")
-	if channelID == "" {
+	channelId := ctx.Query("channelId")
+	if channelId == "" {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId)", true)
 		return
 	}
 
-	if err := c.manager.StopRecord(channelID); err != nil {
+	if err := c.manager.StopRecord(channelId); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) OpenRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) OpenRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID  string `json:"channelId"`
-		TargetIP   net.IP `json:"targetIp"`
+		ChannelId  string `json:"channelId"`
+		TargetIp   net.IP `json:"targetIp"`
 		TargetPort int    `json:"targetPort"`
 		Transport  string `json:"transport"`
 	}{}
@@ -357,7 +361,7 @@ func (c *MediaChannel) OpenRTPPusher(ctx *gin.Context) {
 		return
 	}
 
-	if model.ChannelID == "" || model.TargetIP == nil || model.TargetPort == 0 {
+	if model.ChannelId == "" || model.TargetIp == nil || model.TargetPort == 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,targetIp,targetPort)", true)
 		return
 	}
@@ -365,18 +369,18 @@ func (c *MediaChannel) OpenRTPPusher(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持RTP推流功能", true)
 }
 
-func (c *MediaChannel) StartRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) StartRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
@@ -384,18 +388,18 @@ func (c *MediaChannel) StartRTPPusher(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持RTP推流功能", true)
 }
 
-func (c *MediaChannel) GetRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) GetRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
@@ -403,22 +407,22 @@ func (c *MediaChannel) GetRTPPusher(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持RTP推流功能", true)
 }
 
-func (c *MediaChannel) ListRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) ListRtpPusher(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持列出RTP推流列表", true)
 }
 
-func (c *MediaChannel) CloseRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) CloseRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
@@ -426,10 +430,10 @@ func (c *MediaChannel) CloseRTPPusher(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持RTP推流功能", true)
 }
 
-func (c *MediaChannel) OpenHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) OpenHistoryRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID  string  `json:"channelId"`
-		TargetIP   net.IP  `json:"targetIp"`
+		ChannelId  string  `json:"channelId"`
+		TargetIp   net.IP  `json:"targetIp"`
 		TargetPort int     `json:"targetPort"`
 		Transport  string  `json:"transport"`
 		StartTime  int64   `json:"startTime"`
@@ -456,7 +460,7 @@ func (c *MediaChannel) OpenHistoryRTPPusher(ctx *gin.Context) {
 		return
 	}
 
-	if model.ChannelID == "" || model.TargetIP == nil || model.TargetPort == 0 {
+	if model.ChannelId == "" || model.TargetIp == nil || model.TargetPort == 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,targetIp,targetPort)", true)
 		return
 	}
@@ -466,15 +470,15 @@ func (c *MediaChannel) OpenHistoryRTPPusher(ctx *gin.Context) {
 		ssrc = int64(*model.SSRC)
 	}
 
-	pusher, err := c.manager.OpenHistoryRTPPusher(model.ChannelID, model.TargetIP, model.TargetPort, model.Transport, model.StartTime, model.EndTime, ssrc,
-		func(pusher *mediaChannel.HistoryRTPPusher, channel *mediaChannel.Channel) {
+	pusher, err := c.manager.OpenHistoryRtpPusher(model.ChannelId, model.TargetIp, model.TargetPort, model.Transport, model.StartTime, model.EndTime, ssrc,
+		func(pusher *mediaChannel.HistoryRtpPusher, channel *mediaChannel.Channel) {
 			if eofHookURL != nil {
 				c.notify(eofHookURL.String(), gin.H{
 					"channelId": channel.ID(),
 					"pusherId":  pusher.ID(),
 				})
 			}
-		}, func(pusher *mediaChannel.HistoryRTPPusher, channel *mediaChannel.Channel) {
+		}, func(pusher *mediaChannel.HistoryRtpPusher, channel *mediaChannel.Channel) {
 			if closedHookURL != nil {
 				c.notify(closedHookURL.String(), gin.H{
 					"channelId": channel.ID(),
@@ -489,46 +493,46 @@ func (c *MediaChannel) OpenHistoryRTPPusher(ctx *gin.Context) {
 	responseSuccess(ctx, pusher.Info())
 }
 
-func (c *MediaChannel) StartHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) StartHistoryRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
 
-	if err := c.manager.StartHistoryRTPPusher(model.ChannelID, uint64(model.PusherID)); err != nil {
+	if err := c.manager.StartHistoryRtpPusher(model.ChannelId, uint64(model.PusherId)); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) GetHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) GetHistoryRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
 
-	pusher, err := c.manager.GetHistoryRTPPusher(model.ChannelID, uint64(model.PusherID))
+	pusher, err := c.manager.GetHistoryRtpPusher(model.ChannelId, uint64(model.PusherId))
 	if err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
@@ -536,60 +540,60 @@ func (c *MediaChannel) GetHistoryRTPPusher(ctx *gin.Context) {
 	responseSuccess(ctx, pusher.Info())
 }
 
-func (c *MediaChannel) ListHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) ListHistoryRtpPusher(ctx *gin.Context) {
 	responseErrorMsg(ctx, "此版本暂不支持列出历史音视频RTP推流列表", true)
 }
 
-func (c *MediaChannel) PauseHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) PauseHistoryRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
 
-	if err := c.manager.PauseHistoryRTPPusher(model.ChannelID, uint64(model.PusherID)); err != nil {
+	if err := c.manager.PauseHistoryRtpPusher(model.ChannelId, uint64(model.PusherId)); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) ResumeHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) ResumeHistoryRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
 
-	if err := c.manager.ResumeHistoryRTPPusher(model.ChannelID, uint64(model.PusherID)); err != nil {
+	if err := c.manager.ResumeHistoryRtpPusher(model.ChannelId, uint64(model.PusherId)); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) SeekHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) SeekHistoryRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
 		Time      *int64 `form:"time"`
 	}{}
 
@@ -598,22 +602,22 @@ func (c *MediaChannel) SeekHistoryRTPPusher(ctx *gin.Context) {
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 || model.Time == nil {
+	if model.ChannelId == "" || model.PusherId < 0 || model.Time == nil {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId,time)", true)
 		return
 	}
 
-	if err := c.manager.SeekHistoryRTPPusher(model.ChannelID, uint64(model.PusherID), *model.Time); err != nil {
+	if err := c.manager.SeekHistoryRtpPusher(model.ChannelId, uint64(model.PusherId), *model.Time); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) SetHistoryRTPPusherScale(ctx *gin.Context) {
+func (c *MediaChannel) SetHistoryRtpPusherScale(ctx *gin.Context) {
 	model := struct {
-		ChannelID string  `form:"channelId"`
-		PusherID  int64   `form:"pusherId"`
+		ChannelId string  `form:"channelId"`
+		PusherId  int64   `form:"pusherId"`
 		Scale     float64 `form:"scale"`
 	}{}
 
@@ -622,35 +626,35 @@ func (c *MediaChannel) SetHistoryRTPPusherScale(ctx *gin.Context) {
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 || model.Scale == 0 {
+	if model.ChannelId == "" || model.PusherId < 0 || model.Scale == 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
 
-	if err := c.manager.SetHistoryRTPPusherScale(model.ChannelID, uint64(model.PusherID), model.Scale); err != nil {
+	if err := c.manager.SetHistoryRtpPusherScale(model.ChannelId, uint64(model.PusherId), model.Scale); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	}
 	responseSuccess(ctx, nil)
 }
 
-func (c *MediaChannel) CloseHistoryRTPPusher(ctx *gin.Context) {
+func (c *MediaChannel) CloseHistoryRtpPusher(ctx *gin.Context) {
 	model := struct {
-		ChannelID string `form:"channelId"`
-		PusherID  int64  `form:"pusherId"`
-	}{PusherID: -1}
+		ChannelId string `form:"channelId"`
+		PusherId  int64  `form:"pusherId"`
+	}{PusherId: -1}
 
 	if err := ctx.ShouldBindQuery(&model); err != nil {
 		responseErrorMsg(ctx, fmt.Sprintf("参数解析错误：%s", err.Error()), true)
 		return
 	}
 
-	if model.ChannelID == "" || model.PusherID < 0 {
+	if model.ChannelId == "" || model.PusherId < 0 {
 		responseErrorMsg(ctx, "缺少必须的参数(channelId,pusherId)", true)
 		return
 	}
 
-	if waiter, err := c.manager.CloseHistoryRTPPusher(model.ChannelID, uint64(model.PusherID)); err != nil {
+	if waiter, err := c.manager.CloseHistoryRtpPusher(model.ChannelId, uint64(model.PusherId)); err != nil {
 		responseErrorMsg(ctx, err.Error(), false)
 		return
 	} else if waiter != nil {

@@ -5,5 +5,5 @@ import (
 )
 
 type Storage interface {
-	NewChannel(channel string, cover time.Duration, options ...ChannelOption) (Channel, error)
+	NewChannel(channel string, cover time.Duration, options ...Option) (Channel, error)
 }

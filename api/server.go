@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	ServerModule     = "api.server"
+	ServerModule     = Module + ".server"
 	ServerModuleName = "API服务"
 )
 
@@ -42,6 +42,7 @@ type Server struct {
 	sys          *Sys
 	mediaChannel *MediaChannel
 	gb28181      *GB28181
+	zongHeng     *ZongHeng
 
 	log.AtomicLogger
 	ginLogger log.AtomicLogger
@@ -51,7 +52,12 @@ func newServer() *Server {
 	s := &Server{
 		sys:          GetSys(),
 		mediaChannel: GetMediaChannel(),
-		gb28181:      GetGB28181(),
+	}
+	if gb28181Config := config.GB28181Config(); gb28181Config.Enable {
+		s.gb28181 = GetGB28181()
+	}
+	if zongHengConfig := config.ZongHengConfig(); zongHengConfig.Enable {
+		s.zongHeng = GetZongHeng()
 	}
 	cfg := config.APIConfig()
 	s.s = &http.Server{
@@ -73,30 +79,11 @@ func newServer() *Server {
 
 	api := router.Group("/api/v1")
 	{
-		api.POST("/panic", func(c *gin.Context) {
-			panic(map[string]any{"a": 1, "b": 2})
-		})
 		sysAPI := api.Group("/sys")
 		{
+			sysAPI.POST("/reloadConfig", s.sys.ReloadConfig)
 			sysAPI.POST("/restart", s.sys.Restart)
 			sysAPI.DELETE("/stop", s.sys.Stop)
-		}
-		gb28181API := api.Group("/gb28181")
-		{
-			proxy := gb28181API.Group("/proxy")
-			{
-				proxy.POST("/invite", s.gb28181.ProxyInvite)
-				proxy.POST("/ack", s.gb28181.ProxyAck)
-				proxy.POST("/bye", s.gb28181.ProxyBye)
-				proxy.POST("/info", s.gb28181.ProxyInfo)
-			}
-
-			storageConfig := gb28181API.Group("/storageConfig")
-			{
-				storageConfig.GET("", s.gb28181.GetStorageConfig)
-				storageConfig.PUT("", s.gb28181.AddStorageConfig)
-				storageConfig.DELETE("", s.gb28181.DeleteStorageConfig)
-			}
 		}
 		mediaChannelAPI := api.Group("/media/channel")
 		{
@@ -106,38 +93,83 @@ func newServer() *Server {
 			mediaChannelAPI.POST("", s.mediaChannel.Modify)
 			mediaChannelAPI.DELETE("", s.mediaChannel.Delete)
 
-			mediaChannelAPI.PUT("/openRtpPlayer", s.mediaChannel.OpenRTPPlayer)
-			mediaChannelAPI.POST("/setupRtpPlayer", s.mediaChannel.SetupRTPPlayer)
-			mediaChannelAPI.DELETE("/closeRtpPlayer", s.mediaChannel.CloseRTPPlayer)
+			mediaChannelAPI.PUT("/openRtpPlayer", s.mediaChannel.OpenRtpPlayer)
+			mediaChannelAPI.POST("/setupRtpPlayer", s.mediaChannel.SetupRtpPlayer)
+			mediaChannelAPI.DELETE("/closeRtpPlayer", s.mediaChannel.CloseRtpPlayer)
 
-			mediaChannelAPI.PUT("/openRtspPlayer", s.mediaChannel.OpenRTSPPlayer)
-			mediaChannelAPI.DELETE("/closeRtspPlayer", s.mediaChannel.CloseRTSPPlayer)
+			mediaChannelAPI.PUT("/openRtspPlayer", s.mediaChannel.OpenRtspPlayer)
+			mediaChannelAPI.DELETE("/closeRtspPlayer", s.mediaChannel.CloseRtspPlayer)
 
-			mediaChannelAPI.PUT("/openRtpPusher", s.mediaChannel.OpenRTPPusher)
-			mediaChannelAPI.POST("/startRtpPusher", s.mediaChannel.StartRTPPusher)
-			mediaChannelAPI.GET("/getRtpPusher", s.mediaChannel.GetRTPPusher)
-			mediaChannelAPI.GET("/listRtpPusher", s.mediaChannel.ListRTPPusher)
-			mediaChannelAPI.DELETE("/closeRtpPusher", s.mediaChannel.CloseRTPPusher)
+			mediaChannelAPI.PUT("/openRtpPusher", s.mediaChannel.OpenRtpPusher)
+			mediaChannelAPI.POST("/startRtpPusher", s.mediaChannel.StartRtpPusher)
+			mediaChannelAPI.GET("/getRtpPusher", s.mediaChannel.GetRtpPusher)
+			mediaChannelAPI.GET("/listRtpPusher", s.mediaChannel.ListRtpPusher)
+			mediaChannelAPI.DELETE("/closeRtpPusher", s.mediaChannel.CloseRtpPusher)
 
 			mediaChannelAPI.POST("/startRecord", s.mediaChannel.StartRecord)
 			mediaChannelAPI.POST("/stopRecord", s.mediaChannel.StopRecord)
 
-			mediaChannelAPI.PUT("/openHistoryRtpPusher", s.mediaChannel.OpenHistoryRTPPusher)
-			mediaChannelAPI.POST("/startHistoryRtpPusher", s.mediaChannel.StartHistoryRTPPusher)
-			mediaChannelAPI.GET("/getHistoryRtpPusher", s.mediaChannel.GetHistoryRTPPusher)
-			mediaChannelAPI.GET("/listHistoryRtpPusher", s.mediaChannel.ListHistoryRTPPusher)
-			mediaChannelAPI.POST("/pauseHistoryRtpPusher", s.mediaChannel.PauseHistoryRTPPusher)
-			mediaChannelAPI.POST("/resumeHistoryRtpPusher", s.mediaChannel.ResumeHistoryRTPPusher)
-			mediaChannelAPI.POST("/seekHistoryRtpPusher", s.mediaChannel.SeekHistoryRTPPusher)
-			mediaChannelAPI.POST("/setHistoryRtpPusherScale", s.mediaChannel.SetHistoryRTPPusherScale)
-			mediaChannelAPI.DELETE("/closeHistoryRtpPusher", s.mediaChannel.CloseHistoryRTPPusher)
+			mediaChannelAPI.PUT("/openHistoryRtpPusher", s.mediaChannel.OpenHistoryRtpPusher)
+			mediaChannelAPI.POST("/startHistoryRtpPusher", s.mediaChannel.StartHistoryRtpPusher)
+			mediaChannelAPI.GET("/getHistoryRtpPusher", s.mediaChannel.GetHistoryRtpPusher)
+			mediaChannelAPI.GET("/listHistoryRtpPusher", s.mediaChannel.ListHistoryRtpPusher)
+			mediaChannelAPI.POST("/pauseHistoryRtpPusher", s.mediaChannel.PauseHistoryRtpPusher)
+			mediaChannelAPI.POST("/resumeHistoryRtpPusher", s.mediaChannel.ResumeHistoryRtpPusher)
+			mediaChannelAPI.POST("/seekHistoryRtpPusher", s.mediaChannel.SeekHistoryRtpPusher)
+			mediaChannelAPI.POST("/setHistoryRtpPusherScale", s.mediaChannel.SetHistoryRtpPusherScale)
+			mediaChannelAPI.DELETE("/closeHistoryRtpPusher", s.mediaChannel.CloseHistoryRtpPusher)
+		}
+		if s.gb28181 != nil {
+			gb28181API := api.Group("/gb28181")
+			{
+				proxy := gb28181API.Group("/proxy")
+				{
+					proxy.POST("/invite", s.gb28181.ProxyInvite)
+					proxy.POST("/ack", s.gb28181.ProxyAck)
+					proxy.POST("/bye", s.gb28181.ProxyBye)
+					proxy.POST("/info", s.gb28181.ProxyInfo)
+				}
+
+				storageConfig := gb28181API.Group("/storageConfig")
+				{
+					storageConfig.GET("", s.gb28181.GetStorageConfig)
+					storageConfig.PUT("", s.gb28181.AddStorageConfig)
+					storageConfig.DELETE("", s.gb28181.DeleteStorageConfig)
+				}
+			}
+		}
+		if s.zongHeng != nil {
+			zongHengAPI := api.Group("/zongheng")
+			{
+				channelAPI := zongHengAPI.Group("/channel")
+				{
+					channelAPI.POST("/sync", s.zongHeng.Sync)
+				}
+			}
 		}
 	}
 
 	s.s.Handler = router
 	s.runner = lifecycle.NewWithRun(s.start, s.run, s.close, lifecycle.WithSelf(s))
 	s.Lifecycle = s.runner
+	s.OnClosed(func(l lifecycle.Lifecycle, err error) { s.Logger().Info("API服务已关闭") })
 	return s
+}
+
+func (s *Server) Sys() *Sys {
+	return s.sys
+}
+
+func (s *Server) MediaChannel() *MediaChannel {
+	return s.mediaChannel
+}
+
+func (s *Server) GB28181() *GB28181 {
+	return s.gb28181
+}
+
+func (s *Server) ZongHeng() *ZongHeng {
+	return s.zongHeng
 }
 
 func (s *Server) loggerFormatter(param gin.LogFormatterParams) string {
@@ -203,7 +235,6 @@ func (s *Server) start(lifecycle.Lifecycle) error {
 }
 
 func (s *Server) run(lifecycle.Lifecycle) error {
-	defer s.Logger().Info("API服务已关闭")
 	tlsConfig := config.APIConfig().TLS
 	if tlsConfig.CertFile != "" && tlsConfig.KeyFile != "" {
 		if err := s.s.ServeTLS(s.l, tlsConfig.CertFile, tlsConfig.KeyFile); err != nil {

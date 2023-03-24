@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	GB28181Module     = "api.gb28181"
+	GB28181Module     = Module + ".gb28181"
 	GB28181ModuleName = "国标管理器API服务"
 )
 

@@ -8,7 +8,7 @@ import (
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/cvds-mas/media"
 	mediaRtp "gitee.com/sy_183/cvds-mas/media/rtp"
-	"gitee.com/sy_183/rtp/frame"
+	rtpFrame "gitee.com/sy_183/rtp/frame"
 	rtpServer "gitee.com/sy_183/rtp/server"
 	"io"
 	"net"
@@ -18,38 +18,86 @@ import (
 	"time"
 )
 
-type Frame struct {
-	*frame.Frame
-	mediaType   uint32
-	storageType uint32
+type FrameGroup struct {
+	frames []rtpFrame.FrameWriter
+	start  time.Time
+	end    time.Time
+	size   int
 }
 
-func (f Frame) WriteTo(w io.Writer) (n int64, err error) {
-	return frame.FullLayerWriter{Layer: f.Layer}.WriteTo(w)
+func NewFrameGroup() *FrameGroup {
+	return new(FrameGroup)
 }
 
-func (f Frame) Size() uint {
-	return frame.FullLayerWriter{Layer: f.Layer}.Size()
+func timeRangeExpandRange(start, end *time.Time, curStart, curEnd time.Time, timeNodeLen int) {
+	if start.After(*end) {
+		Logger().Fatal("开始时间在结束时间之后", log.Time("开始时间", *start), log.Time("结束时间", *end))
+	}
+	if curStart.After(curEnd) {
+		Logger().Fatal("开始时间在结束时间之后", log.Time("开始时间", curStart), log.Time("结束时间", curEnd))
+	}
+	if start.IsZero() {
+		*start = curStart
+		*end = curEnd
+	} else {
+		du := curStart.Sub(*end)
+		if du < 0 {
+			guess := time.Duration(0)
+			if timeNodeLen > 2 {
+				guess = (end.Sub(*start)) / time.Duration(timeNodeLen-2)
+			} else if timeNodeLen == 2 {
+				guess = curEnd.Sub(curStart)
+			}
+			offset := du - guess
+			*start = start.Add(offset)
+		}
+		*end = curEnd
+	}
 }
 
-func (f Frame) MediaType() uint32 {
-	return f.mediaType
+func (g *FrameGroup) Append(frameWriter rtpFrame.FrameWriter) {
+	frame := frameWriter.Frame()
+	g.frames = append(g.frames, frameWriter)
+	g.size += frameWriter.Size()
+	timeRangeExpandRange(&g.start, &g.end, frame.(*rtpFrame.IncomingFrame).Start(), frame.(*rtpFrame.IncomingFrame).End(), len(g.frames))
 }
 
-func (f Frame) StorageType() uint32 {
-	return f.storageType
+func (g *FrameGroup) Start() time.Time {
+	return g.start
 }
 
-type FrameInfo struct {
-	Timestamp   uint32
-	PayloadType uint8
-	Start       time.Time
-	End         time.Time
+func (g *FrameGroup) End() time.Time {
+	return g.end
 }
 
-type RTPPlayerCloseCallback func(player *RTPPlayer, channel *Channel)
+func (g *FrameGroup) Size() int {
+	return g.size
+}
 
-type RTPPlayer struct {
+func (g *FrameGroup) WriteTo(w io.Writer) (n int64, err error) {
+	for _, frameWriter := range g.frames {
+		nn, err := frameWriter.WriteTo(w)
+		n += nn
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func (g *FrameGroup) Clear() {
+	for _, frameWriter := range g.frames {
+		frameWriter.Frame().Release()
+	}
+	g.frames = g.frames[:0]
+	g.start = time.Time{}
+	g.end = time.Time{}
+	g.size = 0
+}
+
+type RtpPlayerCloseCallback func(player *RtpPlayer, channel *Channel)
+
+type RtpPlayer struct {
 	lifecycle.Lifecycle
 	runner *lifecycle.DefaultLifecycle
 
@@ -68,20 +116,22 @@ type RTPPlayer struct {
 	mediaMap   atomic.Pointer[[]*media.MediaType]
 	mu         sync.Mutex
 
-	curFrame  atomic.Pointer[FrameInfo]
-	setupTime atomic.Pointer[time.Time]
+	storageBufferSize uint
+	frameGroup        *FrameGroup
 
 	log.AtomicLogger
 }
 
-func NewRTPPlayer(channel *Channel, transport string, timeout time.Duration) (*RTPPlayer, error) {
+func NewRTPPlayer(channel *Channel, transport string, timeout time.Duration) (*RtpPlayer, error) {
 	timeout = def.SetDefault(timeout, time.Second*5)
 	if timeout < time.Second {
 		timeout = time.Second
 	}
-	p := &RTPPlayer{
-		channel: channel,
-		timeout: timeout,
+	p := &RtpPlayer{
+		channel:           channel,
+		timeout:           timeout,
+		storageBufferSize: channel.StorageBufferSize(),
+		frameGroup:        NewFrameGroup(),
 	}
 	p.ssrc.Store(-1)
 
@@ -121,27 +171,27 @@ func NewRTPPlayer(channel *Channel, transport string, timeout time.Duration) (*R
 	return p, nil
 }
 
-func (p *RTPPlayer) DisplayName() string {
-	return p.channel.RTPPlayerDisplayName()
+func (p *RtpPlayer) DisplayName() string {
+	return p.channel.RtpPlayerDisplayName()
 }
 
-func (p *RTPPlayer) Transport() string {
+func (p *RtpPlayer) Transport() string {
 	return p.transport
 }
 
-func (p *RTPPlayer) Timeout() time.Duration {
+func (p *RtpPlayer) Timeout() time.Duration {
 	return p.timeout
 }
 
-func (p *RTPPlayer) LocalIP() net.IP {
+func (p *RtpPlayer) LocalIP() net.IP {
 	return p.localIP
 }
 
-func (p *RTPPlayer) LocalPort() int {
+func (p *RtpPlayer) LocalPort() int {
 	return p.localPort
 }
 
-func (p *RTPPlayer) RemoteIPPort() (net.IP, int) {
+func (p *RtpPlayer) RemoteIPPort() (net.IP, int) {
 	remoteTCPAddr := p.remoteAddr.Load()
 	if remoteTCPAddr == nil {
 		return nil, 0
@@ -149,11 +199,11 @@ func (p *RTPPlayer) RemoteIPPort() (net.IP, int) {
 	return remoteTCPAddr.IP, remoteTCPAddr.Port
 }
 
-func (p *RTPPlayer) SSRC() int64 {
+func (p *RtpPlayer) SSRC() int64 {
 	return p.ssrc.Load()
 }
 
-func (p *RTPPlayer) Info() map[string]any {
+func (p *RtpPlayer) Info() map[string]any {
 	info := map[string]any{
 		"transport": p.Transport(),
 		"timeout":   p.Timeout(),
@@ -171,7 +221,7 @@ func (p *RTPPlayer) Info() map[string]any {
 		rtpMap := make(map[uint8]string)
 		for id, mediaType := range mediaMap {
 			if mediaType != nil {
-				rtpMap[uint8(id)] = mediaType.UpperName
+				rtpMap[uint8(id)] = mediaType.Name
 			}
 		}
 		info["rtpMap"] = rtpMap
@@ -179,22 +229,14 @@ func (p *RTPPlayer) Info() map[string]any {
 	return info
 }
 
-func (p *RTPPlayer) getStream() rtpServer.Stream {
+func (p *RtpPlayer) getStream() rtpServer.Stream {
 	if stream := p.stream.Load(); stream != nil {
 		return *stream
 	}
 	return nil
 }
 
-func (p *RTPPlayer) getSetupTime() time.Time {
-	if tp := p.setupTime.Load(); tp != nil {
-		return *tp
-	}
-	return time.Time{}
-}
-
-func (p *RTPPlayer) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
-	ticker := time.NewTicker(p.timeout / 5)
+func (p *RtpPlayer) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
 	defer func() {
 		if stream := p.getStream(); stream != nil {
 			stream.Close()
@@ -203,82 +245,91 @@ func (p *RTPPlayer) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error 
 			p.rtpManager.Free(p.rtpServer)
 		}
 	}()
-
-	for {
-		select {
-		case now := <-ticker.C:
-			curFrame := p.curFrame.Load()
-			if stream := p.getStream(); stream != nil {
-				var du time.Duration
-				if curFrame == nil {
-					du = now.Sub(p.getSetupTime())
-				} else {
-					du = now.Sub(curFrame.End)
-				}
-				if du > p.timeout {
-					p.Logger().Warn("一段时间内没有接收到任何帧, 关闭拉流", log.Duration("时间", du))
-					p.Close(nil)
-					<-interrupter
-					return nil
-				}
-			}
-		case <-interrupter:
-			return nil
-		}
-	}
+	<-interrupter
+	return nil
 }
 
-func (p *RTPPlayer) handleFrame(stream rtpServer.Stream, f *frame.Frame) {
+func (p *RtpPlayer) storageFrameRaw(frame rtpFrame.Frame, mediaType *media.MediaType) {
+	fw := rtpFrame.NewPayloadFrameWriter(frame)
+	size := fw.Size()
+	if uint(size) > p.storageBufferSize {
+		frame.Release()
+		return
+	}
+	if frameGroup := p.frameGroup; uint(frameGroup.Size()+fw.Size()) > p.storageBufferSize {
+		if storageChannel := p.channel.loadEnabledStorageChannel(); storageChannel != nil {
+			storageChannel.Write(frameGroup, uint(frameGroup.size), frameGroup.Start(), frameGroup.End(), mediaType.ID, true)
+		}
+		p.frameGroup.Clear()
+	}
+	p.frameGroup.Append(fw)
+}
+
+func (p *RtpPlayer) storageFrameRtp(frame rtpFrame.Frame, mediaType *media.MediaType) {
+	fw := rtpFrame.NewFullFrameWriter(frame)
+	size := fw.Size()
+	if uint(size) > p.storageBufferSize {
+		frame.Release()
+		return
+	}
+	if frameGroup := p.frameGroup; uint(frameGroup.Size()+fw.Size()) > p.storageBufferSize {
+		if storageChannel := p.channel.loadEnabledStorageChannel(); storageChannel != nil {
+			storageChannel.Write(frameGroup, uint(frameGroup.size), frameGroup.Start(), frameGroup.End(), mediaType.ID, true)
+		}
+		p.frameGroup.Clear()
+	}
+	p.frameGroup.Append(fw)
+}
+
+func (p *RtpPlayer) handleFrame(stream rtpServer.Stream, frame *rtpFrame.IncomingFrame) {
 	var mediaType *media.MediaType
 	if mediaMap := p.MediaMap(); mediaMap != nil {
-		mediaType = mediaMap[f.PayloadType]
+		mediaType = mediaMap[frame.PayloadType()]
 	}
 	if mediaType == nil {
-		mediaType = media.GetMediaType(uint32(f.PayloadType))
+		mediaType = media.GetMediaType(uint32(frame.PayloadType()))
 	}
+	defer frame.Release()
 	if mediaType != nil && mediaType.ID < 128 {
-		if uint8(mediaType.ID) != f.PayloadType {
-			for _, layer := range f.RTPLayers {
-				layer.SetPayloadType(uint8(mediaType.ID))
-			}
-			f.PayloadType = uint8(mediaType.ID)
+		if uint8(mediaType.ID) != frame.PayloadType() {
+			frame.SetPayloadType(uint8(mediaType.ID))
 		}
-		p.curFrame.Store(&FrameInfo{
-			Timestamp:   f.Timestamp,
-			PayloadType: f.PayloadType,
-			Start:       f.Start,
-			End:         f.End,
-		})
-		if storageChannel := p.channel.loadEnabledStorageChannel(); storageChannel != nil {
-			storageChannel.Write(Frame{
-				Frame:       f,
-				mediaType:   mediaType.ID,
-				storageType: p.channel.StorageType().ID,
-			})
-			return
+		pushers := p.channel.RtpPushers()
+		for _, pusher := range pushers {
+			if pusher.Started() {
+				pusher.Push(rtpFrame.UseFrame(frame))
+			}
+		}
+		switch p.channel.StorageType() {
+		case "rtp":
+			p.storageFrameRtp(frame.Use(), mediaType)
+		case "raw":
+			p.storageFrameRaw(frame.Use(), mediaType)
+		default:
+			p.storageFrameRtp(frame.Use(), mediaType)
 		}
 	}
-	f.Release()
 }
 
-func (p *RTPPlayer) onStreamClosed(stream rtpServer.Stream) {
+func (p *RtpPlayer) onStreamClosed(stream rtpServer.Stream) {
 	stream.Logger().Info("RTP流已经关闭")
 	lock.LockDo(&p.mu, func() {
 		p.stream.Store(nil)
 		if storageChannel := p.channel.loadEnabledStorageChannel(); storageChannel != nil {
 			storageChannel.Sync()
 		}
+		p.Close(nil)
 	})
 }
 
-func (p *RTPPlayer) MediaMap() []*media.MediaType {
+func (p *RtpPlayer) MediaMap() []*media.MediaType {
 	if mediaMap := p.mediaMap.Load(); mediaMap != nil {
 		return *mediaMap
 	}
 	return nil
 }
 
-func (p *RTPPlayer) Setup(rtpMap map[uint8]string, remoteIP net.IP, remotePort int, ssrc int64, once bool) error {
+func (p *RtpPlayer) Setup(rtpMap map[uint8]string, remoteIP net.IP, remotePort int, ssrc int64, once bool) error {
 	return lock.RLockGet(p.runner, func() error {
 		if !p.runner.Running() {
 			return p.Logger().ErrorWith("设置RTP拉流参数失败", lifecycle.NewStateNotRunningError(p.DisplayName()))
@@ -304,25 +355,27 @@ func (p *RTPPlayer) Setup(rtpMap map[uint8]string, remoteIP net.IP, remotePort i
 		}
 
 		return lock.LockGet(&p.mu, func() error {
-			now := time.Now()
+			//now := time.Now()
 			if stream := p.getStream(); stream != nil {
 				if once {
 					return nil
 				}
-				p.setupTime.Store(&now)
+				//p.setupTime.Store(&now)
 				stream.SetRemoteAddr(remoteAddr)
 				stream.SetSSRC(ssrc)
 			} else {
 				p.mediaMap.Store(&mediaMap)
-				stream, _ = p.rtpServer.Stream(remoteAddr, ssrc, frame.NewFrameRTPHandler(frame.FrameHandlerFunc{
+				stream, _ = p.rtpServer.Stream(remoteAddr, ssrc, rtpFrame.NewFrameRTPHandler(rtpFrame.FrameHandlerFunc{
 					HandleFrameFn:    p.handleFrame,
 					OnStreamClosedFn: p.onStreamClosed,
+				}), rtpServer.WithTimeout(p.timeout), rtpServer.WithOnStreamTimeout(func(rtpServer.Stream) {
+					stream.Logger().Warn("RTP流超时, 关闭拉流")
 				}))
 				if stream == nil {
 					p.mediaMap.Store(nil)
 					return p.Logger().ErrorWith("设置RTP拉流参数失败", errors.New("RTP服务申请流失败"))
 				}
-				p.setupTime.Store(&now)
+				//p.setupTime.Store(&now)
 				p.stream.Store(&stream)
 			}
 

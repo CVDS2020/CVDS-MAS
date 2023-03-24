@@ -7,6 +7,7 @@ import (
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/cvds-mas/storage"
 	"gitee.com/sy_183/cvds-mas/storage/file/context"
+	"gitee.com/sy_183/cvds-mas/storage/meta"
 	"os"
 )
 
@@ -46,15 +47,15 @@ func (s *ReadSession) Read(buf []byte, index storage.Index) (n int, err error) {
 		if !s.runner.Running() {
 			return 0, storage.ReadSessionClosedError
 		}
-		fileIndex := index.(*Index)
+		fileIndex := index.(*meta.Index)
 		metaManager := s.channel.metaManager
-		var file *File
+		var file *meta.File
 		ctx := s.ctx
 		if ctx != nil {
-			file = s.ctx.FileContext().(*File)
+			file = s.ctx.FileContext().(*meta.File)
 		}
-		if ctx == nil || file.Seq != fileIndex.FileSeq {
-			newFile := metaManager.GetFile(fileIndex.FileSeq)
+		if ctx == nil || file.Seq != fileIndex.FileSeq() {
+			newFile := metaManager.GetFile(fileIndex.FileSeq())
 			if newFile == nil {
 				return 0, errors.New("索引指向的文件已被删除")
 			}
@@ -74,8 +75,8 @@ func (s *ReadSession) Read(buf []byte, index storage.Index) (n int, err error) {
 			s.ctx = res.Context
 		}
 		var seek *context.Seek
-		if s.ctx.Offset() != int64(fileIndex.FileOffset) {
-			seek = &context.Seek{Offset: int64(fileIndex.FileOffset)}
+		if s.ctx.Offset() != int64(fileIndex.FileOffset()) {
+			seek = &context.Seek{Offset: int64(fileIndex.FileOffset())}
 		}
 		res := s.ctx.Read(&context.ReadRequest{
 			Buf:  buf,
@@ -86,7 +87,7 @@ func (s *ReadSession) Read(buf []byte, index storage.Index) (n int, err error) {
 			s.channel.Logger().ErrorWith("读取文件失败", res.Err,
 				log.String("文件路径", res.File()),
 				log.Int("读取大小", len(res.Data)),
-				log.Uint64("读取位置", fileIndex.FileOffset),
+				log.Uint64("读取位置", fileIndex.FileOffset()),
 				log.Duration("花费时间", res.Elapse()),
 			)
 			return len(res.Data), res.Err
@@ -94,7 +95,7 @@ func (s *ReadSession) Read(buf []byte, index storage.Index) (n int, err error) {
 		s.channel.Logger().Info("读取文件成功",
 			log.String("文件路径", res.File()),
 			log.Int("读取大小", len(res.Data)),
-			log.Uint64("读取位置", fileIndex.FileOffset),
+			log.Uint64("读取位置", fileIndex.FileOffset()),
 			log.Duration("花费时间", res.Elapse()),
 		)
 		return len(res.Data), nil

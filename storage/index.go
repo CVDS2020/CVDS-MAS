@@ -1,17 +1,43 @@
 package storage
 
+import (
+	"gitee.com/sy_183/common/log"
+)
+
 type Index interface {
-	Sequence() uint64
+	Seq() uint64
 
-	StartTime() int64
+	Start() int64
 
-	EndTime() int64
+	SetStart(start int64) Index
 
-	DataSize() uint64
+	End() int64
 
-	GetState() uint64
+	SetEnd(end int64) Index
 
-	CloneIndex() Index
+	FileSeq() uint64
+
+	SetFileSeq(seq uint64) Index
+
+	FileOffset() uint64
+
+	SetFileOffset(offset uint64) Index
+
+	Size() uint64
+
+	SetSize(size uint64) Index
+
+	StorageType() uint32
+
+	SetStorageType(typ uint32) Index
+
+	State() uint64
+
+	SetState(state uint64) Index
+
+	Clone() Index
+
+	log.ObjectMarshaler
 }
 
 type Indexes interface {

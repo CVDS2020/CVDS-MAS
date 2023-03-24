@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	ChannelManagerModule     = "gb28181.channel-manager"
+	ChannelManagerModule     = Module + ".channel-manager"
 	ChannelManagerModuleName = "国标通道管理器"
 )
 
@@ -23,8 +23,7 @@ const MaxChannel = 1024
 
 type ChannelManager struct {
 	lifecycle.Lifecycle
-	runner    *lifecycle.DefaultLifecycle
-	available bool
+	runner *lifecycle.DefaultLifecycle
 
 	dbManager            *db.DBManager
 	mcManager            *mediaChannel.Manager
@@ -61,21 +60,27 @@ func (m *ChannelManager) start(_ lifecycle.Lifecycle, interrupter chan struct{})
 	}
 
 	for i := range channels {
-		ch := newChannel(&channels[i], m)
-		if _, exist := m.channels.LoadOrStore(ch.Name(), ch); exist {
-			m.Logger().Error("通道名称重复", log.String("通道名称", ch.Name()))
+		channel := newChannel(&channels[i], m)
+		if _, exist := m.channels.LoadOrStore(channel.Name(), channel); exist {
+			m.Logger().Error("通道名称重复，忽略此通道", log.String("通道名称", channel.Name()))
+			continue
 		}
-		ch.OnClosed(func(l lifecycle.Lifecycle, err error) {
-			ch.Logger().Info("通道已关闭")
-			m.channels.Delete(ch.Name())
+		const loggerConfigReloadedCallbackId = "loggerConfigReloadedCallbackId"
+		config.InitModuleLogger(channel, ChannelModule, channel.DisplayName())
+		channel.SetField(loggerConfigReloadedCallbackId, config.RegisterLoggerConfigReloadedCallback(channel, ChannelModule, channel.DisplayName()))
+		channel.OnClosed(func(l lifecycle.Lifecycle, err error) {
+			channel.Logger().Info("通道已关闭")
+			m.channels.Delete(channel.Name())
+			config.UnregisterLoggerConfigReloadedCallback(channel.Field(loggerConfigReloadedCallbackId).(uint64))
 		}).OnStarted(func(l lifecycle.Lifecycle, err error) {
 			if err != nil {
-				m.channels.Delete(ch.Name())
+				m.channels.Delete(channel.Name())
+				config.UnregisterLoggerConfigReloadedCallback(channel.Field(loggerConfigReloadedCallbackId).(uint64))
 			} else {
-				ch.Logger().Info("通道启动成功")
+				channel.Logger().Info("通道启动成功")
 			}
 		}).Background()
-		m.Logger().Info("通道创建成功", log.String("通道名称", ch.Name()))
+		m.Logger().Info("通道创建成功", log.String("通道名称", channel.Name()))
 	}
 
 	return nil

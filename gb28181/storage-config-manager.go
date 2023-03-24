@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	StorageConfigManagerModule     = "gb28181.storage-config-manager"
+	StorageConfigManagerModule     = Module + ".storage-config-manager"
 	StorageConfigManagerModuleName = "存储配置管理器"
 )
 

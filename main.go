@@ -6,22 +6,24 @@ import (
 	syssvc "gitee.com/sy_183/common/system/service"
 	"gitee.com/sy_183/cvds-mas/app"
 	"gitee.com/sy_183/cvds-mas/config"
-	defaultLogger "gitee.com/sy_183/cvds-mas/logger"
 	"github.com/common-nighthawk/go-figure"
 	"os"
 )
 
+const (
+	Module     = "main"
+	ModuleName = "MAIN"
+)
+
 var logger log.AtomicLogger
+
+func init() {
+	config.InitModuleDefaultLogger(&logger, ModuleName)
+	config.RegisterLoggerConfigReloadedCallback(&logger, Module, ModuleName)
+}
 
 func Logger() *log.Logger {
 	return logger.Logger()
-}
-
-func init() {
-	logger.SetLogger(defaultLogger.Logger())
-	config.Context().RegisterConfigReloadedCallback(func(_, nc *config.Config) {
-		logger.SetLogger(nc.Log.MustBuild("main"))
-	})
 }
 
 func printFigure() {

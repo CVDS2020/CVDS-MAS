@@ -1,23 +1,19 @@
 package ps
 
 import (
-	"bytes"
 	"encoding/binary"
-	"errors"
+	"io"
 )
 
-var ElementaryStreamMapLengthInvalidError = errors.New("elementary stream map length invalid")
-var PSMStreamIdError = errors.New("PSM stream id error")
-
 type ElementaryStreamInfo struct {
-	_type       uint8
+	typ         uint8
 	id          uint8
 	infoLength  uint16
 	descriptors []byte
 }
 
 func (i *ElementaryStreamInfo) Type() uint8 {
-	return i._type
+	return i.typ
 }
 
 func (i *ElementaryStreamInfo) Id() uint8 {
@@ -32,19 +28,26 @@ func (i *ElementaryStreamInfo) Descriptors() []byte {
 	return i.descriptors
 }
 
-func (i *ElementaryStreamInfo) Write(sb *bytes.Buffer) {
-	sb.WriteByte(i._type)
-	sb.WriteByte(i.id)
-	tmp := make([]byte, 2)
-	binary.BigEndian.PutUint16(tmp, i.infoLength)
-	sb.Write(tmp)
-	sb.Write(i.descriptors[:i.infoLength])
+func (i *ElementaryStreamInfo) Size() uint {
+	return uint(4 + len(i.descriptors))
 }
 
-const PSMDisplay = "PSM"
+func (i *ElementaryStreamInfo) WriteTo(w io.Writer) (n int64, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = e.(error)
+		}
+	}()
+	buf := [4]byte{i.typ, i.id}
+	binary.BigEndian.PutUint16(buf[2:], i.infoLength)
+	WritePanic(w, buf[:], &n)
+	WritePanic(w, i.descriptors[:i.infoLength], &n)
+	return
+}
 
 type PSM struct {
-	PESGenericPrefix
+	startCode                 [4]byte
+	packetLength              uint16
 	bytes2                    [2]byte
 	programStreamInfoLength   uint16
 	descriptors               []byte
@@ -53,96 +56,79 @@ type PSM struct {
 	crc32                     uint32
 }
 
-//func (m *PSM) Parse(s *stream.QueueStream) ParseResult {
-//	result := m.PESGenericPrefix.Parse(s)
-//	switch result.State {
-//	case ParseStateNotEnough, ParseStateError:
-//		return result
-//	}
-//
-//	if m.streamId != StreamIdProgramStreamMap {
-//		return ParseResult{State: ParseStateError, ErrCode: PSMStreamIdError2.ErrCode}
-//	}
-//
-//	need2 := uint16(10)
-//	if m.pesPacketLength < need2 {
-//		return ParseResult{State: ParseStateError, ErrCode: PESPacketLengthError.ErrCode}
-//	}
-//
-//	data := stream.MustBytes(s.Read(4))
-//	m.programStreamInfoLength = binary.BigEndian.Uint16(data[2:])
-//	if need2 += m.programStreamInfoLength; m.pesPacketLength < need2 {
-//		return ParseResult{State: ParseStateError, ErrCode: PESPacketLengthError.ErrCode}
-//	}
-//	m.bytes2[0], m.bytes2[1] = data[0], data[1]
-//
-//	data = stream.MustBytes(s.Read(uint(m.programStreamInfoLength) + 2))
-//	m.descriptors = data[:m.programStreamInfoLength]
-//	m.elementaryStreamMapLength = binary.BigEndian.Uint16(data[m.programStreamInfoLength:])
-//	if need2 += m.elementaryStreamMapLength; m.pesPacketLength < need2 {
-//		return ParseResult{State: ParseStateError, ErrCode: PESPacketLengthError.ErrCode}
-//	}
-//
-//	data = stream.MustBytes(s.Read(uint(m.elementaryStreamMapLength) + 4))
-//	m.elementaryStreamInfos = m.elementaryStreamInfos[:0]
-//	var need3 uint16
-//	for len(data) > 4 {
-//		info := ElementaryStreamInfo{}
-//		if need3 += 4; m.elementaryStreamMapLength < need3 {
-//			return ParseResult{State: ParseStateError, ErrCode: ElementaryStreamMapLengthError.ErrCode}
-//		}
-//		info.infoLength = binary.BigEndian.Uint16(data[2:])
-//		if need3 += info.infoLength; m.elementaryStreamMapLength < need3 {
-//			return ParseResult{State: ParseStateError, ErrCode: ElementaryStreamMapLengthError.ErrCode}
-//		}
-//		info._type = data[0]
-//		info.id = data[1]
-//		info.descriptors = data[4 : 4+info.infoLength]
-//		m.elementaryStreamInfos = append(m.elementaryStreamInfos, info)
-//		data = data[4+info.infoLength:]
-//	}
-//
-//	m.crc32 = binary.BigEndian.Uint32(data)
-//
-//	return ParseResult{State: ParseStateComplete}
-//}
-
-func (m *PSM) CurrentNextIndicator() uint8 {
-	return (m.bytes2[0] & 0b10000000) >> 7
+func (p *PSM) StartCode() [4]byte {
+	return p.startCode
 }
 
-func (m *PSM) ProgramStreamMapVersion() uint8 {
-	return m.bytes2[0] & 0b00011111
+func (p *PSM) StreamId() uint8 {
+	return p.startCode[3]
 }
 
-func (m *PSM) ProgramStreamInfoLength() uint16 {
-	return m.programStreamInfoLength
+func (p *PSM) PacketLength() uint16 {
+	return p.packetLength
 }
 
-func (m *PSM) Descriptors() []byte {
-	return m.descriptors
+func (p *PSM) CurrentNextIndicator() uint8 {
+	return (p.bytes2[0] & 0b10000000) >> 7
 }
 
-func (m *PSM) ElementaryStreamInfos() []ElementaryStreamInfo {
-	return m.elementaryStreamInfos
+func (p *PSM) ProgramStreamMapVersion() uint8 {
+	return p.bytes2[0] & 0b00011111
 }
 
-func (m *PSM) CRC32() uint32 {
-	return m.crc32
+func (p *PSM) ProgramStreamInfoLength() uint16 {
+	return p.programStreamInfoLength
 }
 
-func (m *PSM) WriteTo(buf *bytes.Buffer) {
-	m.PESGenericPrefix.Write(buf)
-	tmp := make([]byte, 4)
-	buf.Write(m.bytes2[:])
-	binary.BigEndian.PutUint16(tmp, m.programStreamInfoLength)
-	buf.Write(tmp[:2])
-	buf.Write(m.descriptors[:m.programStreamInfoLength])
-	binary.BigEndian.PutUint16(tmp, m.elementaryStreamMapLength)
-	buf.Write(tmp[:2])
-	for _, info := range m.elementaryStreamInfos {
-		info.Write(buf)
+func (p *PSM) Descriptors() []byte {
+	return p.descriptors
+}
+
+func (p *PSM) ElementaryStreamInfos() []ElementaryStreamInfo {
+	return p.elementaryStreamInfos
+}
+
+func (p *PSM) CRC32() uint32 {
+	return p.crc32
+}
+
+func (p *PSM) Size() uint {
+	if p.startCode[3] == 0 {
+		return 0
 	}
-	binary.BigEndian.PutUint32(tmp, m.crc32)
-	buf.Write(tmp)
+	return uint(6 + p.packetLength)
+}
+
+func (p *PSM) WriteTo(w io.Writer) (n int64, err error) {
+	if p.startCode[3] == 0 {
+		return 0, nil
+	}
+	defer func() {
+		if e := recover(); e != nil {
+			err = e.(error)
+		}
+	}()
+
+	buf := [16]byte{}
+	writer := Writer{Buf: buf[:]}
+
+	WriteAndResetPanic(writer.WriteBytesAnd(p.startCode[:]).
+		WriteUint16(p.packetLength).
+		WriteBytesAnd(p.bytes2[:]).
+		WriteUint16(p.programStreamInfoLength), w, &n)
+	WritePanic(w, p.descriptors[:p.programStreamInfoLength], &n)
+	WriteAndResetPanic(writer.WriteUint16(p.elementaryStreamMapLength), w, &n)
+	for i := uint16(0); i < p.elementaryStreamMapLength; i++ {
+		WriteToPanic(&p.elementaryStreamInfos[i], w, &n)
+	}
+	WriteAndResetPanic(writer.WriteUint32(p.crc32), w, &n)
+	return
+}
+
+func (p *PSM) Clear() {
+	p.startCode = [4]byte{}
+	p.packetLength = 0
+	p.programStreamInfoLength = 0
+	p.elementaryStreamMapLength = 0
+	p.elementaryStreamInfos = p.elementaryStreamInfos[:0]
 }

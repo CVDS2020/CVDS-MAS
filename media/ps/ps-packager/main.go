@@ -1,4 +1,4 @@
-package channel
+package main
 
 import (
 	"bytes"
@@ -11,23 +11,22 @@ import (
 	"math"
 	"net"
 	"os"
-	"testing"
 	"time"
 )
 
-func TestH264PesRtpPackager(t *testing.T) {
-	packager := NewH264PesRtpPackager()
-	parser := ps.NewFrameParser()
+func main() {
+	psFrameParser := ps.NewFrameParser()
+	psRtpPackger := ps.NewRtpPackager(0)
 
 	fp, err := os.Open("C:\\Users\\suy\\Documents\\Language\\Go\\cvds-cmu\\data\\44010200491320000123_44010200491320000123\\C2074-车厢1-转向架-20230314200939-2.mpg")
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
 	defer fp.Close()
 
 	conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IP{192, 168, 80, 1}, Port: 5004})
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
 	defer conn.Close()
 
@@ -45,7 +44,7 @@ func TestH264PesRtpPackager(t *testing.T) {
 		}
 		chunks = chunks[:0]
 
-		streamInfos := parser.StreamInfos()
+		streamInfos := psFrameParser.StreamInfos()
 		if streamInfos == nil {
 			frame.Release()
 			return
@@ -58,18 +57,13 @@ func TestH264PesRtpPackager(t *testing.T) {
 		}
 
 		rtpFrame := rtpFramePool.Get().Use()
-		for _, pes := range frame.PES() {
-			if pes.StreamId() == streamInfo.StreamId() {
-				packager.Package(pes, rtpFrame.Append)
-			}
+		if err := psRtpPackger.Package(frame, rtpFrame.Append); err != nil {
+			panic(err)
 		}
-		packager.Complete(rtpFrame.Append)
-		rtpFrame.SetPayloadType(media.MediaTypeH264.PT)
+
+		rtpFrame.SetPayloadType(media.MediaTypePS.PT)
 		rtpFrame.SetTimestamp(timestamp)
 		timestamp += 3600
-		if rtpFrame.Len() > 0 {
-			rtpFrame.Packet(rtpFrame.Len() - 1).SetMarker(true)
-		}
 
 		frame.AddRelation(rtpFrame)
 		rtpFrame.Range(func(i int, packet rtp.Packet) bool {
@@ -77,7 +71,7 @@ func TestH264PesRtpPackager(t *testing.T) {
 			seq++
 			packet.WriteTo(rtpWriteBuffer)
 			if _, err := conn.Write(rtpWriteBuffer.Bytes()); err != nil {
-				t.Fatal(err)
+				panic(err)
 			}
 			rtpWriteBuffer.Reset()
 			//fmt.Println(packet)
@@ -95,24 +89,24 @@ func TestH264PesRtpPackager(t *testing.T) {
 			n, err := fp.Read(data.Data)
 			if err != nil {
 				if err == io.EOF {
-					if parser.Complete() {
-						handleFrame(parser.Take())
+					if psFrameParser.Complete() {
+						handleFrame(psFrameParser.Take())
 					}
-					parser.Free()
+					psFrameParser.Free()
 					return true
 				}
-				t.Fatal(err)
+				panic(err)
 			}
 
 			remain := data.Data[:n]
 			for len(remain) > 0 {
-				ok, err := parser.ParseP(remain, &remain)
+				ok, err := psFrameParser.ParseP(remain, &remain)
 				if ok {
-					handleFrame(parser.Take())
+					handleFrame(psFrameParser.Take())
 				}
 				if err != nil {
 					data.Release()
-					t.Fatal(err)
+					panic(err)
 				}
 				if !ok {
 					chunks = append(chunks, data.Use())

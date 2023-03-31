@@ -1,4 +1,4 @@
-package rtsp
+package rtsp2
 
 import (
 	"encoding/binary"
@@ -40,7 +40,6 @@ var (
 	RtspStatusCodeError      = errors.New("RTSP状态码错误")
 	RtspMethodError          = errors.New("无效的RTSP方法")
 	RtspHeaderFormatError    = errors.New("RTSP头部格式错误")
-	RtpPacketAllocError      = errors.New("RTSP包申请错误")
 )
 
 type HeaderParser struct {
@@ -347,8 +346,8 @@ func (p *Parser) parseStartLine(data []byte, remainP *[]byte) (ok bool, err erro
 			p.message = &p.response.Message
 			resp := p.response
 
-			resp.Proto = line1
-			resp.ProtoMajor, resp.ProtoMinor, ok = parseRTSPVersion(resp.Proto)
+			resp.proto = line1
+			resp.protoMajor, resp.protoMinor, ok = parseRTSPVersion(resp.proto)
 			if !ok {
 				return false, RtspVersionError
 			}
@@ -356,12 +355,12 @@ func (p *Parser) parseStartLine(data []byte, remainP *[]byte) (ok bool, err erro
 			if len(line2) != 3 {
 				return false, RtspStatusCodeError
 			}
-			resp.StatusCode, err = strconv.Atoi(line2)
-			if err != nil || resp.StatusCode < 0 {
+			resp.statusCode, err = strconv.Atoi(line2)
+			if err != nil || resp.statusCode < 0 {
 				return false, RtspStatusCodeError
 			}
 
-			resp.ReasonPhrase = line3
+			resp.reasonPhrase = line3
 			return true, nil
 		}
 		p.packetType = PacketTypeRequest
@@ -369,18 +368,18 @@ func (p *Parser) parseStartLine(data []byte, remainP *[]byte) (ok bool, err erro
 		p.message = &p.request.Message
 		req := p.request
 
-		req.Method = line1
-		if !validMethod(req.Method) {
+		req.method = line1
+		if !validMethod(req.method) {
 			return false, RtspMethodError
 		}
 
-		req.RequestURI = line2
-		if req.URL, err = url.ParseRequestURI(req.RequestURI); err != nil {
+		req.requestURI = line2
+		if req.url, err = url.ParseRequestURI(req.requestURI); err != nil {
 			return false, err
 		}
 
-		req.Proto = line3
-		if req.ProtoMajor, req.ProtoMinor, ok = parseRTSPVersion(req.Proto); !ok {
+		req.proto = line3
+		if req.protoMajor, req.protoMinor, ok = parseRTSPVersion(req.proto); !ok {
 			return false, RtspVersionError
 		}
 		return true, nil
@@ -389,7 +388,7 @@ func (p *Parser) parseStartLine(data []byte, remainP *[]byte) (ok bool, err erro
 }
 
 func (p *Parser) parseHeaderFields() (contentLength int64, err error) {
-	if header := p.message.Header; header != nil {
+	if header := p.message.header; header != nil {
 		if clHeader := header["Content-Length"]; len(clHeader) > 0 {
 			contentLength, err := strconv.ParseInt(clHeader[0], 10, 64)
 			if err != nil {
@@ -397,22 +396,22 @@ func (p *Parser) parseHeaderFields() (contentLength int64, err error) {
 			} else if contentLength < 0 || contentLength > p.maxContentLength {
 				return 0, errors.NewSizeOutOfRange("RTSP正文", 0, p.maxContentLength, contentLength, true)
 			}
-			p.message.ContentLength = contentLength
+			p.message.contentLength = contentLength
 		}
 		if ctHeader := header["Content-Type"]; len(ctHeader) > 0 {
-			p.message.ContentType = ctHeader[0]
+			p.message.contentType = ctHeader[0]
 		}
 		if cSeqHeader := header["Cseq"]; len(cSeqHeader) > 0 {
 			cSeq, err := strconv.ParseInt(cSeqHeader[0], 10, 64)
 			if err != nil {
-				return p.message.ContentLength, err
+				return p.message.contentLength, err
 			} else if cSeq < 0 {
-				return p.message.ContentLength, errors.New("解析RTSP CSeq错误")
+				return p.message.contentLength, errors.New("解析RTSP CSeq错误")
 			}
-			p.message.CSeq = int(cSeq)
+			p.message.cSeq = int(cSeq)
 		}
 		if session := header["Session"]; len(session) > 0 {
-			p.message.Session = session[0]
+			p.message.session = session[0]
 		}
 	}
 	return 0, nil
@@ -431,7 +430,7 @@ func (p *Parser) parseHeader(data []byte, remainP *[]byte) (ok bool, err error) 
 				p.state = parserStateParseStartCode
 			}
 		} else if ok {
-			if p.message.ContentLength > 0 {
+			if p.message.contentLength > 0 {
 				p.state = parserStateParseBody
 				p.needParser.SetNeed(int(contentLength))
 			} else {
@@ -442,7 +441,7 @@ func (p *Parser) parseHeader(data []byte, remainP *[]byte) (ok bool, err error) 
 
 	if ok, *remainP, err = p.headerParser.Parse(data); ok {
 		if header := p.headerParser.Header(); header != nil {
-			p.message.Header = header
+			p.message.header = header
 			if contentLength, err = p.parseHeaderFields(); err != nil {
 				return false, err
 			}
@@ -459,7 +458,7 @@ func (p *Parser) parseBody(data []byte, remainP *[]byte) (ok bool) {
 		return false
 	}
 	if *remainP, ok = p.needParser.Parse(data); ok {
-		p.message.Body = p.needParser.Get()
+		p.message.body = p.needParser.Get()
 		p.state = parserStateParseStartCode
 	}
 	return
@@ -485,7 +484,7 @@ func (p *Parser) parseRtpPrefix(data []byte, remainP *[]byte) (ok bool, err erro
 			p.rtpPacket.Release()
 			p.rtpPacket = p.rtpPacketPool.Get()
 			if p.rtpPacket == nil {
-				return false, RtpPacketAllocError
+				return false, pool.NewAllocError("RTP包")
 			}
 			p.rtpPacket.Use()
 		}

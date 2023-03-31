@@ -43,11 +43,11 @@ func (h *PSH) PackStuffingLength() uint8 {
 	return h.bytes10[9] & 0b00000111
 }
 
-func (h *PSH) Size() uint {
+func (h *PSH) Size() int {
 	if h.startCode[3] == 0 {
 		return 0
 	}
-	return 14 + uint(h.PackStuffingLength())
+	return 14 + int(h.PackStuffingLength())
 }
 
 func (h *PSH) WriteTo(w io.Writer) (n int64, err error) {

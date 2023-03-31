@@ -6,9 +6,9 @@ import (
 	"gitee.com/sy_183/cvds-mas/api"
 	"gitee.com/sy_183/cvds-mas/config"
 	"gitee.com/sy_183/cvds-mas/db"
-	"gitee.com/sy_183/cvds-mas/gb28181"
 	mediaChannel "gitee.com/sy_183/cvds-mas/media/channel"
 	"gitee.com/sy_183/cvds-mas/media/rtp"
+	"gitee.com/sy_183/cvds-mas/media/rtsp2"
 	"gitee.com/sy_183/cvds-mas/zongheng"
 	rtpServer "gitee.com/sy_183/rtp/server"
 )
@@ -17,12 +17,14 @@ type App struct {
 	lifecycle.Lifecycle
 	list *lifecycle.List
 
-	gb28181DBManager            *db.DBManager
-	gb28181ChannelManager       *gb28181.ChannelManager
-	gb28181StorageConfigManager *gb28181.StorageConfigManager
+	gb28181DBManager *db.DBManager
+	//gb28181ChannelManager       *gb28181.ChannelManager
+	//gb28181StorageConfigManager *gb28181.StorageConfigManager
 
 	zongHengDBManager      *db.DBManager
 	zongHengChannelManager *zongheng.ChannelManager
+
+	rtspServer *rtsp2.Server
 
 	apiServer           *api.Server
 	mediaChannelManager *mediaChannel.Manager
@@ -33,16 +35,17 @@ type App struct {
 func newApp() *App {
 	app := &App{
 		apiServer:           api.GetServer(),
+		rtspServer:          rtsp2.GetServer(),
 		mediaChannelManager: mediaChannel.GetManager(),
 		rtpTCPServer:        rtp.GetRetryableTCPServer(),
 		rtpManager:          rtp.GetManager(),
 	}
 
-	if app.apiServer.GB28181() != nil {
-		app.gb28181DBManager = gb28181.GetDBManager()
-		app.gb28181ChannelManager = gb28181.GetChannelManager()
-		app.gb28181StorageConfigManager = gb28181.GetStorageConfigManager()
-	}
+	//if app.apiServer.GB28181() != nil {
+	//	app.gb28181DBManager = gb28181.GetDBManager()
+	//	app.gb28181ChannelManager = gb28181.GetChannelManager()
+	//	app.gb28181StorageConfigManager = gb28181.GetStorageConfigManager()
+	//}
 
 	if app.apiServer.ZongHeng() != nil {
 		app.zongHengDBManager = zongheng.GetDBManager()
@@ -54,24 +57,25 @@ func newApp() *App {
 			MustAdd(rtp.ManagerModule, app.rtpManager).Group().
 			MustAdd(rtp.TCPServerModule, app.rtpTCPServer).Group(),
 		).List().
-		MustAppend(app.mediaChannelManager).List(),
+		MustAppend(app.mediaChannelManager).List().
+		MustAppend(app.rtspServer).List(),
 	).Group()
 
-	if app.gb28181DBManager != nil {
-		group1.MustAdd(gb28181.DBManagerModule, app.gb28181DBManager).SetCloseAllOnExit(false)
-	}
+	//if app.gb28181DBManager != nil {
+	//	group1.MustAdd(gb28181.DBManagerModule, app.gb28181DBManager).SetCloseAllOnExit(false)
+	//}
 	if app.zongHengDBManager != nil {
 		group1.MustAdd(zongheng.DBManagerModule, app.zongHengDBManager).SetCloseAllOnExit(false)
 	}
 
 	app.list = lifecycle.NewList().MustAppend(group1).List()
 
-	if app.gb28181ChannelManager != nil && app.gb28181StorageConfigManager != nil {
-		app.list.MustAppend(lifecycle.NewGroup().
-			MustAdd(gb28181.ChannelManagerModule, app.gb28181ChannelManager).Group().
-			MustAdd(gb28181.StorageConfigManagerModule, app.gb28181StorageConfigManager).Group(),
-		)
-	}
+	//if app.gb28181ChannelManager != nil && app.gb28181StorageConfigManager != nil {
+	//	app.list.MustAppend(lifecycle.NewGroup().
+	//		MustAdd(gb28181.ChannelManagerModule, app.gb28181ChannelManager).Group().
+	//		MustAdd(gb28181.StorageConfigManagerModule, app.gb28181StorageConfigManager).Group(),
+	//	)
+	//}
 	if app.zongHengChannelManager != nil {
 		app.list.MustAppend(app.zongHengChannelManager)
 	}

@@ -11,6 +11,7 @@ import (
 	mapUtils "gitee.com/sy_183/common/utils/map"
 	"gitee.com/sy_183/cvds-mas/config"
 	"gitee.com/sy_183/cvds-mas/db"
+	"gitee.com/sy_183/cvds-mas/media"
 	mediaChannel "gitee.com/sy_183/cvds-mas/media/channel"
 	"gitee.com/sy_183/cvds-mas/storage"
 	fileStorage "gitee.com/sy_183/cvds-mas/storage/file"
@@ -51,6 +52,8 @@ type ChannelManager struct {
 	syncInterval  time.Duration
 	syncSignal    chan struct{}
 
+	storageBufferSize uint
+
 	log.AtomicLogger
 }
 
@@ -74,6 +77,8 @@ func NewChannelManager() *ChannelManager {
 		checkInterval: checkInterval,
 		syncInterval:  syncInterval,
 		syncSignal:    make(chan struct{}, 1),
+
+		storageBufferSize: cfg.StorageBuffer.Uint(),
 	}
 
 	config.InitModuleLogger(m, ChannelManagerModule, ChannelManagerModuleName)
@@ -248,10 +253,10 @@ func (m *ChannelManager) syncChannels() error {
 	return nil
 }
 
-func (m *ChannelManager) checkChannel(channel *Channel, waiter *syncPkg.WaitGroup) error {
+func (m *ChannelManager) checkChannel(channel *Channel, waiter *syncPkg.WaitGroup) (err error) {
 	mc, model := channel.mc, channel.model
 	localIp := config.MediaRTPConfig().GetLocalIP()
-	if err := mc.SetupStorage(time.Hour * 24); err != nil {
+	if err := mc.SetupStorage(time.Hour*24, m.storageBufferSize); err != nil {
 		return err
 	}
 	sc := mc.StorageChannel()
@@ -284,21 +289,56 @@ func (m *ChannelManager) checkChannel(channel *Channel, waiter *syncPkg.WaitGrou
 	if err := mc.StartRecord(); err != nil {
 		return err
 	}
-	player, err := mc.OpenRtpPlayer("tcp", 0, nil)
+	player, err := mc.OpenRtpPlayer(nil)
 	if err != nil {
 		if _, is := err.(*errors.Exist); is {
 			return nil
 		}
 		return err
 	}
-	waiter.Add(1)
-	go func() {
-		defer waiter.Done()
-		mediaInfo, err := m.endpoint.StartStream(model.ChannelId, model.DeviceId, "tcp", localIp, player.LocalPort())
+	defer func() {
 		if err != nil {
-			return
+			if waiter, err := mc.CloseRtpPlayer(); err == nil {
+				<-waiter
+			}
 		}
-		mc.SetupRtpPlayer(mediaInfo.RtpMap, mediaInfo.RemoteIP, mediaInfo.RemotePort, mediaInfo.SSRC, true)
+	}()
+	streamPlayer, err := player.AddStream("tcp")
+	if err != nil {
+		return err
+	}
+	waiter.Add(1)
+	go func() (err error) {
+		defer func() {
+			if err != nil {
+				if waiter, err := mc.CloseRtpPlayer(); err == nil {
+					<-waiter
+				}
+			}
+			waiter.Done()
+		}()
+		mediaInfo, err := m.endpoint.StartStream(model.ChannelId, model.DeviceId, "tcp", localIp, streamPlayer.LocalPort())
+		if err != nil {
+			return err
+		}
+		var streamInfo *media.RtpStreamInfo
+		for _, sdpRtpMap := range mediaInfo.RtpMap {
+			mediaType := media.ParseMediaType(sdpRtpMap.Format)
+			if mediaType == nil {
+				continue
+			}
+			if sdpRtpMap.Type >= 128 || sdpRtpMap.Type < 0 {
+				continue
+			}
+			streamInfo = media.NewRtpStreamInfo(mediaType, nil, uint8(sdpRtpMap.Type), sdpRtpMap.Rate)
+		}
+		if streamInfo == nil {
+			err = errors.NewNotFound("RTP流信息")
+			m.Logger().Error(err.Error())
+			return err
+		}
+		err = streamPlayer.Setup(mediaInfo.RemoteIP, mediaInfo.RemotePort, mediaInfo.SSRC, streamInfo, mediaChannel.SetupConfig{})
+		return err
 	}()
 	return nil
 }

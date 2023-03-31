@@ -41,8 +41,9 @@ type Server struct {
 
 	sys          *Sys
 	mediaChannel *MediaChannel
-	gb28181      *GB28181
-	zongHeng     *ZongHeng
+	//gb28181      *GB28181
+	zongHeng *ZongHeng
+	rtsp     *RTSP
 
 	log.AtomicLogger
 	ginLogger log.AtomicLogger
@@ -52,10 +53,11 @@ func newServer() *Server {
 	s := &Server{
 		sys:          GetSys(),
 		mediaChannel: GetMediaChannel(),
+		rtsp:         GetRTSP(),
 	}
-	if gb28181Config := config.GB28181Config(); gb28181Config.Enable {
-		s.gb28181 = GetGB28181()
-	}
+	//if gb28181Config := config.GB28181Config(); gb28181Config.Enable {
+	//	s.gb28181 = GetGB28181()
+	//}
 	if zongHengConfig := config.ZongHengConfig(); zongHengConfig.Enable {
 		s.zongHeng = GetZongHeng()
 	}
@@ -89,55 +91,65 @@ func newServer() *Server {
 		{
 			mediaChannelAPI.PUT("", s.mediaChannel.Create)
 			mediaChannelAPI.GET("", s.mediaChannel.Get)
-			mediaChannelAPI.GET("/list", s.mediaChannel.List)
 			mediaChannelAPI.POST("", s.mediaChannel.Modify)
 			mediaChannelAPI.DELETE("", s.mediaChannel.Delete)
 
 			mediaChannelAPI.PUT("/openRtpPlayer", s.mediaChannel.OpenRtpPlayer)
-			mediaChannelAPI.POST("/setupRtpPlayer", s.mediaChannel.SetupRtpPlayer)
+			mediaChannelAPI.GET("/getRtpPlayer", s.mediaChannel.GetRtpPlayer)
+			mediaChannelAPI.PUT("/rtpPlayerAddStream", s.mediaChannel.RtpPlayerAddStream)
+			mediaChannelAPI.POST("/rtpPlayerSetupStream", s.mediaChannel.RtpPlayerSetupStream)
+			mediaChannelAPI.DELETE("/rtpPlayerRemoveStream", s.mediaChannel.RtpPlayerRemoveStream)
 			mediaChannelAPI.DELETE("/closeRtpPlayer", s.mediaChannel.CloseRtpPlayer)
 
-			mediaChannelAPI.PUT("/openRtspPlayer", s.mediaChannel.OpenRtspPlayer)
-			mediaChannelAPI.DELETE("/closeRtspPlayer", s.mediaChannel.CloseRtspPlayer)
-
-			mediaChannelAPI.PUT("/openRtpPusher", s.mediaChannel.OpenRtpPusher)
-			mediaChannelAPI.POST("/startRtpPusher", s.mediaChannel.StartRtpPusher)
-			mediaChannelAPI.GET("/getRtpPusher", s.mediaChannel.GetRtpPusher)
-			mediaChannelAPI.GET("/listRtpPusher", s.mediaChannel.ListRtpPusher)
-			mediaChannelAPI.DELETE("/closeRtpPusher", s.mediaChannel.CloseRtpPusher)
-
+			mediaChannelAPI.POST("/setupStorage", s.mediaChannel.SetupStorage)
+			mediaChannelAPI.POST("/stopStorage", s.mediaChannel.StopStorage)
 			mediaChannelAPI.POST("/startRecord", s.mediaChannel.StartRecord)
 			mediaChannelAPI.POST("/stopRecord", s.mediaChannel.StopRecord)
 
+			mediaChannelAPI.PUT("/openRtpPusher", s.mediaChannel.OpenRtpPusher)
+			mediaChannelAPI.GET("/getRtpPusher", s.mediaChannel.GetRtpPusher)
+			mediaChannelAPI.PUT("/rtpPusherAddStream", s.mediaChannel.RtpPusherAddStream)
+			mediaChannelAPI.POST("/rtpPusherStartPush", s.mediaChannel.RtpPusherStartPush)
+			mediaChannelAPI.POST("/rtpPusherPause", s.mediaChannel.RtpPusherPause)
+			mediaChannelAPI.DELETE("/rtpPusherRemoveStream", s.mediaChannel.RtpPusherRemoveStream)
+			mediaChannelAPI.DELETE("/closeRtpPusher", s.mediaChannel.CloseRtpPusher)
+
 			mediaChannelAPI.PUT("/openHistoryRtpPusher", s.mediaChannel.OpenHistoryRtpPusher)
-			mediaChannelAPI.POST("/startHistoryRtpPusher", s.mediaChannel.StartHistoryRtpPusher)
 			mediaChannelAPI.GET("/getHistoryRtpPusher", s.mediaChannel.GetHistoryRtpPusher)
-			mediaChannelAPI.GET("/listHistoryRtpPusher", s.mediaChannel.ListHistoryRtpPusher)
-			mediaChannelAPI.POST("/pauseHistoryRtpPusher", s.mediaChannel.PauseHistoryRtpPusher)
-			mediaChannelAPI.POST("/resumeHistoryRtpPusher", s.mediaChannel.ResumeHistoryRtpPusher)
-			mediaChannelAPI.POST("/seekHistoryRtpPusher", s.mediaChannel.SeekHistoryRtpPusher)
-			mediaChannelAPI.POST("/setHistoryRtpPusherScale", s.mediaChannel.SetHistoryRtpPusherScale)
+			mediaChannelAPI.PUT("/historyRtpPusherAddStream", s.mediaChannel.HistoryRtpPusherAddStream)
+			mediaChannelAPI.POST("/historyRtpPusherStartPush", s.mediaChannel.HistoryRtpPusherStartPush)
+			mediaChannelAPI.POST("/historyRtpPusherPause", s.mediaChannel.HistoryRtpPusherPause)
+			mediaChannelAPI.POST("/historyRtpPusherSeek", s.mediaChannel.HistoryRtpPusherSeek)
+			mediaChannelAPI.POST("/historyRtpPusherSetScale", s.mediaChannel.HistoryRtpPusherSetScale)
+			mediaChannelAPI.DELETE("/historyRtpPusherRemoveStream", s.mediaChannel.HistoryRtpPusherRemoveStream)
 			mediaChannelAPI.DELETE("/closeHistoryRtpPusher", s.mediaChannel.CloseHistoryRtpPusher)
 		}
-		if s.gb28181 != nil {
-			gb28181API := api.Group("/gb28181")
-			{
-				proxy := gb28181API.Group("/proxy")
-				{
-					proxy.POST("/invite", s.gb28181.ProxyInvite)
-					proxy.POST("/ack", s.gb28181.ProxyAck)
-					proxy.POST("/bye", s.gb28181.ProxyBye)
-					proxy.POST("/info", s.gb28181.ProxyInfo)
-				}
-
-				storageConfig := gb28181API.Group("/storageConfig")
-				{
-					storageConfig.GET("", s.gb28181.GetStorageConfig)
-					storageConfig.PUT("", s.gb28181.AddStorageConfig)
-					storageConfig.DELETE("", s.gb28181.DeleteStorageConfig)
-				}
-			}
+		rtspAPI := api.Group("/media/rtsp")
+		{
+			rtspAPI.PUT("/channel", s.rtsp.AddChannel)
+			rtspAPI.GET("/channel", s.rtsp.GetChannel)
+			rtspAPI.GET("/channels", s.rtsp.PathChannels)
+			rtspAPI.DELETE("/channel", s.rtsp.DeleteChannel)
 		}
+		//if s.gb28181 != nil {
+		//	gb28181API := api.Group("/gb28181")
+		//	{
+		//		proxy := gb28181API.Group("/proxy")
+		//		{
+		//			proxy.POST("/invite", s.gb28181.ProxyInvite)
+		//			proxy.POST("/ack", s.gb28181.ProxyAck)
+		//			proxy.POST("/bye", s.gb28181.ProxyBye)
+		//			proxy.POST("/info", s.gb28181.ProxyInfo)
+		//		}
+		//
+		//		storageConfig := gb28181API.Group("/storageConfig")
+		//		{
+		//			storageConfig.GET("", s.gb28181.GetStorageConfig)
+		//			storageConfig.PUT("", s.gb28181.AddStorageConfig)
+		//			storageConfig.DELETE("", s.gb28181.DeleteStorageConfig)
+		//		}
+		//	}
+		//}
 		if s.zongHeng != nil {
 			zongHengAPI := api.Group("/zongheng")
 			{
@@ -164,9 +176,9 @@ func (s *Server) MediaChannel() *MediaChannel {
 	return s.mediaChannel
 }
 
-func (s *Server) GB28181() *GB28181 {
-	return s.gb28181
-}
+//func (s *Server) GB28181() *GB28181 {
+//	return s.gb28181
+//}
 
 func (s *Server) ZongHeng() *ZongHeng {
 	return s.zongHeng

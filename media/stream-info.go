@@ -37,10 +37,27 @@ func (i *BaseStreamInfo) Equal(other StreamInfo) bool {
 type RtpStreamInfo struct {
 	BaseStreamInfo
 	payloadType uint8
+	clockRate   int
+}
+
+func NewRtpStreamInfo(mediaType *MediaType, parent StreamInfo, payloadType uint8, clockRate int) *RtpStreamInfo {
+	i := &RtpStreamInfo{payloadType: payloadType, clockRate: clockRate}
+	i.Init(mediaType, parent)
+	return i
 }
 
 func (i *RtpStreamInfo) PayloadType() uint8 {
+	if i.payloadType >= 128 {
+		return 128
+	}
 	return i.payloadType
+}
+
+func (i *RtpStreamInfo) ClockRate() int {
+	if i.clockRate <= 0 {
+		return i.mediaType.ClockRate
+	}
+	return i.clockRate
 }
 
 func (i *RtpStreamInfo) Equal(other StreamInfo) bool {
@@ -53,7 +70,7 @@ func (i *RtpStreamInfo) Equal(other StreamInfo) bool {
 	if !ok || o == nil {
 		return false
 	}
-	return i.mediaType.ID == o.mediaType.ID && (i.payloadType == o.payloadType || (i.payloadType >= 128 && o.payloadType >= 128))
+	return i.mediaType.ID == o.mediaType.ID && i.PayloadType() == o.PayloadType() && i.ClockRate() == o.ClockRate()
 }
 
 func (i *RtpStreamInfo) MarshalLogObject(encoder log.ObjectEncoder) error {
@@ -63,5 +80,6 @@ func (i *RtpStreamInfo) MarshalLogObject(encoder log.ObjectEncoder) error {
 	if i.payloadType < 128 {
 		encoder.AddUint8("流负载类型", i.payloadType)
 	}
+	encoder.AddInt("时钟频率", i.ClockRate())
 	return nil
 }

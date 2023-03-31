@@ -4,8 +4,6 @@ import (
 	"gitee.com/sy_183/common/config"
 	"gitee.com/sy_183/common/log"
 	logConfig "gitee.com/sy_183/common/log/config"
-	"gitee.com/sy_183/common/sgr"
-	"gitee.com/sy_183/common/uns"
 )
 
 const (
@@ -288,18 +286,18 @@ func charWidth(ch rune) int {
 }
 
 func ReloadModuleLogger(oc, nc *Config, logger log.LoggerProvider, module, moduleName string) {
-	var width int
-	for _, ch := range moduleName {
-		width += charWidth(ch)
-	}
-	if width < 36 {
-		fill := make([]byte, 36-width)
-		for i := range fill {
-			fill[i] = ' '
-		}
-		moduleName += uns.BytesToString(fill)
-	}
-	moduleName = sgr.WrapColor(moduleName, sgr.FgCyan)
+	//var width int
+	//for _, ch := range moduleName {
+	//	width += charWidth(ch)
+	//}
+	//if width < 36 {
+	//	fill := make([]byte, 36-width)
+	//	for i := range fill {
+	//		fill[i] = ' '
+	//	}
+	//	moduleName += uns.BytesToString(fill)
+	//}
+	//moduleName = sgr.WrapColor(moduleName, sgr.FgCyan)
 	if nl, err := nc.Log.Build(module); err == nil {
 		// 使用模块指定的日志配置
 		logger.SetLogger(nl.Named(moduleName))

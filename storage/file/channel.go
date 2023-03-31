@@ -48,6 +48,7 @@ const (
 	MinCheckDeleteInterval = 10 * time.Millisecond
 
 	DefaultWriteBufferSize  = unit.MeBiByte
+	MinWriteBufferSize      = 64 * unit.KiBiByte
 	DefaultWriteBufferCount = 2
 
 	// 默认最大同步请求个数为128
@@ -91,7 +92,8 @@ type Channel struct {
 	checkDeleteInterval time.Duration
 
 	// 写缓冲区大小，如果写入后的大小超过此大小，则在写入前先执行同步到磁盘
-	writeBufferSize uint
+	writeBufferSize         uint
+	writeBufferPoolProvider pool.PoolProvider[*Buffer]
 	// 写入缓冲区池，用于申请写入缓冲区，如果缓冲区申请失败，则丢弃当前正在写入的数据，并生成数据被丢弃的索引
 	writeBufferPool pool.Pool[*Buffer]
 	// 此互斥锁用于同步写入数据、写入流丢失信息和执行同步这三个接口
@@ -153,12 +155,18 @@ func NewChannel(name string, options ...storage.Option) *Channel {
 		c.checkDeleteInterval = MinCheckDeleteInterval
 	}
 
-	if c.writeBufferPool == nil {
-		c.writeBufferSize = DefaultWriteBufferSize
-		c.writeBufferPool = pool.NewStackPool(func(p *pool.StackPool[*Buffer]) *Buffer {
-			return NewBuffer(c.writeBufferSize)
-		}, DefaultWriteBufferCount)
+	c.writeBufferSize = def.SetDefault(c.writeBufferSize, DefaultWriteBufferSize)
+	if c.writeBufferSize < MinWriteBufferSize {
+		c.writeBufferSize = MinWriteBufferSize
 	}
+
+	if c.writeBufferPoolProvider == nil {
+		c.writeBufferPoolProvider = pool.StackPoolProvider[*Buffer](DefaultWriteBufferCount)
+	}
+
+	c.writeBufferPool = c.writeBufferPoolProvider(func(p pool.Pool[*Buffer]) *Buffer {
+		return NewBuffer(c.writeBufferSize)
+	})
 
 	if c.syncReqs == nil {
 		c.syncReqs = container.NewQueue[syncRequest](DefaultMaxSyncReqs)

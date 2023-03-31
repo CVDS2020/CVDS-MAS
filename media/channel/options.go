@@ -23,12 +23,6 @@ func WithStorageType(storageType string) Option {
 	})
 }
 
-func WithStorageBufferSize(storageBufferSize uint) Option {
-	return OptionFunc(func(channel *Channel) {
-		channel.storageBufferSize = storageBufferSize
-	})
-}
-
 func WithFields(fields map[string]any) Option {
 	return OptionFunc(func(channel *Channel) {
 		for name, value := range fields {

@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func printNALU(header NALUHeader, body [][]byte, bodySize int) {
-	fmt.Printf("NALU Type: %d, NALU Size: %d\n", header.Type(), bodySize)
+func printNALU(header NALUHeader, body NALUBody) {
+	fmt.Printf("NALU Type: %d, NALU Size: %d\n", header.Type(), body.Size())
 }
 
 func parse(p *AnnexBInPrefixNALUParser, data []byte, isPrefix bool) {

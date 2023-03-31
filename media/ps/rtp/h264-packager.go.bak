@@ -21,9 +21,8 @@ type H264PesRtpPackager struct {
 	maxRtpPayload  int
 	h264NALUParser *h264.AnnexBInPrefixNALUParser
 
-	naluHeader   h264.NALUHeader
-	naluBody     [][]byte
-	naluBodySize int
+	naluHeader h264.NALUHeader
+	naluBody   h264.NALUBody
 }
 
 func WithMaxRtpPayload(maxRtpPayload int) option.Option[Packager, any] {
@@ -63,7 +62,7 @@ func (p *H264PesRtpPackager) setMaxRtpPayload(maxRtpPayload int) {
 }
 
 func (p *H264PesRtpPackager) doPackage(rtpAppender func(packet rtp.Packet) bool) error {
-	if p.naluBodySize+1 <= p.maxRtpPayload {
+	if p.naluBody.Size()+1 <= p.maxRtpPayload {
 		// 使用单一NALU包
 		packet := p.packetPool.Get()
 		if packet == nil {
@@ -72,9 +71,10 @@ func (p *H264PesRtpPackager) doPackage(rtpAppender func(packet rtp.Packet) bool)
 		packet.AddRef()
 		payload := &ioUtils.OpWriter{OpBuf: make([]byte, 0, 2+len(p.naluBody)*ioUtils.BytesOpSize)}
 		payload.AppendByte(byte(p.naluHeader))
-		for _, body := range p.naluBody {
-			payload.AppendBytes(body)
-		}
+		p.naluBody.Range(func(chunk []byte) bool {
+			payload.AppendBytes(chunk)
+			return true
+		})
 		packet.SetMarker(true)
 		packet.SetPayload(payload)
 		rtpAppender(packet)
@@ -82,7 +82,7 @@ func (p *H264PesRtpPackager) doPackage(rtpAppender func(packet rtp.Packet) bool)
 		return nil
 	}
 	// 使用FU NALU包
-	remain := p.naluBodySize
+	remain := p.naluBody.Size()
 	start, end := true, false
 	naluBodyLinear := NewChunksLinear(p.naluBody, p.naluBodySize)
 	for remain > 0 {

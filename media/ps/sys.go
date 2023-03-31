@@ -80,11 +80,11 @@ func (s *SYS) StreamInfos() []SysStreamInfo {
 	return s.streamInfos
 }
 
-func (s *SYS) Size() uint {
+func (s *SYS) Size() int {
 	if s.startCode[3] == 0 {
 		return 0
 	}
-	return 6 + uint(s.headerLength)
+	return 6 + int(s.headerLength)
 }
 
 func (s *SYS) WriteTo(w io.Writer) (n int64, err error) {

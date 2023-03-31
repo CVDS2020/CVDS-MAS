@@ -53,9 +53,7 @@ func WithWriteBufferPoolConfig(writeBufferSize uint, provider pool.PoolProvider[
 	return storage.OptionCustom(func(c storage.Channel) {
 		if fc, is := c.(*Channel); is {
 			fc.writeBufferSize = writeBufferSize
-			fc.writeBufferPool = provider(func(p pool.Pool[*Buffer]) *Buffer {
-				return NewBuffer(writeBufferSize)
-			})
+			fc.writeBufferPoolProvider = provider
 		}
 	})
 }

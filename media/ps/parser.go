@@ -201,7 +201,7 @@ func (p *Parser) parsePSMHeader(data []byte, remainP *[]byte) (ok bool, err erro
 
 		esiRaw := raw[:psm.elementaryStreamMapLength]
 		var esiMin uint16
-		for len(esiRaw) > 4 {
+		for len(esiRaw) >= 4 {
 			if esiMin += 4; psm.elementaryStreamMapLength < esiMin {
 				return false, PSMElementaryStreamMapLengthError
 			}
@@ -248,7 +248,6 @@ func (p *Parser) parsePESPacketLength(data []byte, remainP *[]byte) (ok bool, er
 			StreamIdProgramStreamDirectory,
 			StreamIdISO13818_6DSMCCStream,
 			StreamIdITUH2221TypeE:
-			p.pes.packDataLength = p.pes.packetLength
 			p.state = parserStateParsePacketData
 			p.needParser.SetNeed(int(pes.packetLength))
 		default:
@@ -404,9 +403,9 @@ func (p *Parser) parsePESHeader(data []byte, remainP *[]byte) (ok bool, err erro
 			}
 		}
 
-		pes.packDataLength = pes.packetLength - uint16(pes.headerDataLength) - 3
+		packetDataSize := pes.packetLength - uint16(pes.headerDataLength) - 3
 		p.state = parserStateParsePacketData
-		p.needParser.SetNeed(int(pes.packDataLength))
+		p.needParser.SetNeed(int(packetDataSize))
 		return true, nil
 	}
 	return false, nil
@@ -414,7 +413,10 @@ func (p *Parser) parsePESHeader(data []byte, remainP *[]byte) (ok bool, err erro
 
 func (p *Parser) parsePESPacketData(data []byte, remainP *[]byte) bool {
 	if p.needParser.ParseP(data, remainP) {
-		p.pes.packetData = p.needParser.Get()
+		p.pes.packetData = PESPacketData{
+			chunks: p.needParser.Get(),
+			size:   p.needParser.Need(),
+		}
 		p.state = parserStateFindStartCode
 		return true
 	}

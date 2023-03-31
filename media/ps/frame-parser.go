@@ -251,6 +251,7 @@ func (p *FrameParser) Parse(data []byte) (ok bool, remain []byte, err error) {
 		if err != nil {
 			if p.curFrame != nil {
 				p.curFrame.Release()
+				p.curFrame = nil
 			}
 		}
 	}()
@@ -264,22 +265,22 @@ func (p *FrameParser) Parse(data []byte) (ok bool, remain []byte, err error) {
 			case *PSH:
 				curFrame := p.getCurFrame()
 				if curFrame == nil {
-					return true, remain, errors.New("申请PS帧失败")
+					return false, remain, pool.NewAllocError("PS帧")
 				}
 				if curFrame.psh == nil {
 					curFrame.psh = pack
 					if !p.resetPSH() {
-						return false, remain, errors.New("申请PS.PSH失败")
+						return false, remain, pool.NewAllocError("PS.PSH")
 					}
 				} else {
 					p.complete()
 					curFrame = p.getCurFrame()
 					if curFrame == nil {
-						return true, remain, errors.New("申请PS帧失败")
+						return true, remain, pool.NewAllocError("PS帧")
 					}
 					curFrame.psh = pack
 					if !p.resetPSH() {
-						return true, remain, errors.New("申请PS.PSH失败")
+						return true, remain, pool.NewAllocError("PS.PSH")
 					}
 					return true, remain, nil
 				}
@@ -288,7 +289,7 @@ func (p *FrameParser) Parse(data []byte) (ok bool, remain []byte, err error) {
 					if curFrame.sys == nil {
 						curFrame.sys = pack
 						if !p.resetSYS() {
-							return false, remain, errors.New("申请PS.SYS失败")
+							return false, remain, pool.NewAllocError("申请PS.SYS失败")
 						}
 					} else {
 						pack.Clear()
@@ -302,7 +303,7 @@ func (p *FrameParser) Parse(data []byte) (ok bool, remain []byte, err error) {
 					if curFrame.psm == nil {
 						curFrame.psm = pack
 						if !p.resetPSM() {
-							return false, remain, errors.New("申请PS.PSM失败")
+							return false, remain, pool.NewAllocError("PS.PSM")
 						}
 					} else {
 						pack.Clear()
@@ -315,7 +316,7 @@ func (p *FrameParser) Parse(data []byte) (ok bool, remain []byte, err error) {
 				if curFrame := p.curFrame; curFrame != nil {
 					curFrame.pes = append(curFrame.pes, pack)
 					if !p.resetPES() {
-						return false, remain, errors.New("申请PS.PES失败")
+						return false, remain, pool.NewAllocError("PS.PES")
 					}
 				} else {
 					pack.Clear()

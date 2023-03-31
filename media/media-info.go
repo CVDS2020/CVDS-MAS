@@ -21,7 +21,7 @@ type MediaInfo struct {
 	Transport  string
 	Protocol   string
 	SSRC       int64
-	RtpMap     map[uint8]string
+	RtpMap     map[uint8]*sdp.RtpMap
 }
 
 func NewMediaInfoFromSDP(content []byte) (*MediaInfo, error) {
@@ -72,7 +72,7 @@ func NewMediaInfoFromSDP(content []byte) (*MediaInfo, error) {
 			return nil, errors.NewNotFound("实时流的IP信息")
 		}
 	}
-	rtpMap := make(map[uint8]string)
+	rtpMap := make(map[uint8]*sdp.RtpMap)
 	for _, attribute := range sdpMedia.Attributes {
 		if attribute.Key == "rtpmap" {
 			sdpRtpMap, e := sdp.ParseRtpMap(attribute.Value)
@@ -80,7 +80,7 @@ func NewMediaInfoFromSDP(content []byte) (*MediaInfo, error) {
 				return nil, errors.NewInvalidArgument("media.rtpmap", e)
 			}
 			if sdpRtpMap.Type > 0 && sdpRtpMap.Type < 128 {
-				rtpMap[uint8(sdpRtpMap.Type)] = sdpRtpMap.Format
+				rtpMap[uint8(sdpRtpMap.Type)] = sdpRtpMap
 			}
 		}
 	}

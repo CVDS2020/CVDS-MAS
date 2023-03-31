@@ -1,249 +1,222 @@
 package channel
 
 import (
-	"bytes"
+	"gitee.com/sy_183/common/container"
 	"gitee.com/sy_183/common/lifecycle"
+	"gitee.com/sy_183/common/lock"
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/common/utils"
+	"gitee.com/sy_183/cvds-mas/media"
 	rtpFrame "gitee.com/sy_183/rtp/frame"
-	"gitee.com/sy_183/rtp/rtp"
-	"math/rand"
 	"net"
-	"strings"
+	"sync"
 	"sync/atomic"
+)
+
+const (
+	DefaultPusherMaxCached = 4
+	MaxPusherMaxCached     = 50
 )
 
 type (
 	RtpPusherClosedCallback func(pusher *RtpPusher, channel *Channel)
 )
 
+type rtpFramePusherWrapper struct {
+	rtpFrame.Frame
+	streamId uint64
+}
+
 type RtpPusher struct {
 	lifecycle.Lifecycle
-	runner  *lifecycle.DefaultLifecycle
-	started atomic.Bool
+	runner *lifecycle.DefaultLifecycle
+	once   atomic.Bool
 
 	id      uint64
 	channel *Channel
 
-	transport  string
-	localIp    net.IP
-	localPort  int
-	remoteIp   net.IP
-	remotePort int
-	ssrc       uint32
+	streamPusherId    atomic.Uint64
+	streamPusherCount atomic.Int64
+	streamPushers     container.SyncMap[uint64, *RtpStreamPusher]
+	streamPusherLock  sync.Mutex
 
-	tcpConn *net.TCPConn
-	udpConn *net.UDPConn
+	maxCached    int
+	frameChannel chan rtpFramePusherWrapper
 
-	frameChannel chan rtpFrame.Frame
-	pushSignal   chan struct{}
+	canPushFlag atomic.Bool
+	closeFlag   atomic.Bool
+	pushSignal  chan struct{}
+	pauseSignal chan struct{}
 
 	log.AtomicLogger
 }
 
-func NewRtpPusher(id uint64, channel *Channel, remoteIp net.IP, remotePort int, transport string, ssrc int64) (*RtpPusher, error) {
-	if ipv4 := remoteIp.To4(); ipv4 != nil {
-		remoteIp = ipv4
+func newRtpPusher(id uint64, channel *Channel, maxCached int) *RtpPusher {
+	if maxCached <= 0 {
+		maxCached = DefaultPusherMaxCached
+	} else if maxCached > MaxPusherMaxCached {
+		maxCached = MaxPusherMaxCached
 	}
-
-	switch strings.ToLower(transport) {
-	case "tcp":
-		transport = "tcp"
-	default:
-		transport = "udp"
-	}
-
-	var tcpConn *net.TCPConn
-	var udpConn *net.UDPConn
-	var localIp net.IP
-	var localPort int
-	switch transport {
-	case "tcp":
-		conn, err := net.DialTCP("tcp", nil, &net.TCPAddr{
-			IP:   remoteIp,
-			Port: remotePort,
-		})
-		if err != nil {
-			return nil, err
-		}
-		tcpConn = conn
-		localAddr := conn.LocalAddr().(*net.TCPAddr)
-		if ipv4 := localAddr.IP.To4(); ipv4 != nil {
-			localIp = ipv4
-		} else {
-			localIp = localAddr.IP
-		}
-		localPort = localAddr.Port
-	case "udp":
-		conn, err := net.DialUDP("udp", nil, &net.UDPAddr{
-			IP:   remoteIp,
-			Port: remotePort,
-		})
-		if err != nil {
-			return nil, err
-		}
-		udpConn = conn
-		localAddr := conn.LocalAddr().(*net.UDPAddr)
-		if ipv4 := localAddr.IP.To4(); ipv4 != nil {
-			localIp = ipv4
-		} else {
-			localIp = localAddr.IP
-		}
-		localPort = localAddr.Port
-	}
-
 	p := &RtpPusher{
 		id:      id,
 		channel: channel,
 
-		transport:  transport,
-		localIp:    localIp,
-		localPort:  localPort,
-		remoteIp:   remoteIp,
-		remotePort: remotePort,
+		maxCached:    maxCached,
+		frameChannel: make(chan rtpFramePusherWrapper, maxCached),
 
-		tcpConn: tcpConn,
-		udpConn: udpConn,
-
-		frameChannel: make(chan rtpFrame.Frame, 10),
-		pushSignal:   make(chan struct{}, 1),
+		pushSignal:  make(chan struct{}, 1),
+		pauseSignal: make(chan struct{}, 1),
 	}
 
-	if ssrc < 0 {
-		p.ssrc = rand.Uint32()
-	} else {
-		p.ssrc = uint32(ssrc)
-	}
+	p.pauseSignal <- struct{}{}
 
 	p.SetLogger(channel.Logger().Named(p.DisplayName()))
 	p.runner = lifecycle.NewWithInterruptedRun(nil, p.run)
 	p.Lifecycle = p.runner
-	return p, nil
+	return p
+}
+
+func (p *RtpPusher) Id() uint64 {
+	return p.id
 }
 
 func (p *RtpPusher) DisplayName() string {
 	return p.channel.RtpPusherDisplayName(p.id)
 }
 
-func (p *RtpPusher) ID() uint64 {
-	return p.id
-}
-
-func (p *RtpPusher) LocalIp() net.IP {
-	return p.localIp
-}
-
-func (p *RtpPusher) LocalPort() int {
-	return p.localPort
-}
-
-func (p *RtpPusher) RemoteIp() net.IP {
-	return p.remoteIp
-}
-
-func (p *RtpPusher) RemotePort() int {
-	return p.remotePort
-}
-
-func (p *RtpPusher) SSRC() uint32 {
-	return p.ssrc
-}
-
-func (p *RtpPusher) Info() map[string]any {
-	return map[string]any{
-		"pusherId":   p.ID(),
-		"localIp":    p.LocalIp(),
-		"localPort":  p.LocalPort(),
-		"remoteIp":   p.RemoteIp(),
-		"remotePort": p.RemotePort(),
-		"ssrc":       p.SSRC(),
-	}
-}
-
-func (p *RtpPusher) send(frame rtpFrame.Frame, buffer *bytes.Buffer) (err error) {
-	defer func() {
-		buffer.Reset()
-		frame.Release()
-	}()
-	if p.udpConn != nil {
-		frame.Range(func(i int, packet rtp.Packet) bool {
-			packet.WriteTo(buffer)
-			if _, err = p.udpConn.Write(buffer.Bytes()); err != nil {
-				p.Logger().ErrorWith("发送基于UDP传输的RTP数据失败", err)
-				return false
-			}
-			return true
-		})
-	} else {
-		rtpFrame.NewFullFrameWriter(frame).WriteTo(buffer)
-		if _, err = p.tcpConn.Write(buffer.Bytes()); err != nil {
-			p.Logger().ErrorWith("发送基于TCP传输的RTP数据失败", err)
-			return err
-		}
+func (p *RtpPusher) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	if !p.once.CompareAndSwap(false, true) {
+		return lifecycle.NewStateClosedError(p.DisplayName())
 	}
 	return nil
 }
 
-func (p *RtpPusher) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
-	if p.started.Load() {
-		return lifecycle.NewStateClosedError(p.DisplayName())
-	}
-	for {
-		select {
-		case <-p.pushSignal:
-			p.started.Store(true)
-			return nil
-		case <-interrupter:
-			err := lifecycle.NewInterruptedError(p.DisplayName(), "启动")
-			p.Logger().Warn(err.Error())
-			return err
-		}
-	}
-}
-
 func (p *RtpPusher) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
 	defer func() {
+		p.closeFlag.Store(true)
 		close(p.frameChannel)
 		for frame := range p.frameChannel {
 			frame.Release()
 		}
-		if p.tcpConn != nil {
-			p.tcpConn.Close()
-		}
-		if p.udpConn != nil {
-			p.udpConn.Close()
+		if streamPushers := p.streamPushers.Values(); len(streamPushers) > 0 {
+			for _, streamPusher := range streamPushers {
+				p.RemoveStream(streamPusher.id)
+			}
 		}
 	}()
-	var writeBuffer = bytes.Buffer{}
+
 	for {
 		select {
+		case <-p.pauseSignal:
+		pause:
+			for {
+				select {
+				case <-interrupter:
+					return nil
+				case <-p.pauseSignal:
+				case <-p.pushSignal:
+					break pause
+				}
+			}
+		case <-p.pushSignal:
 		case frame := <-p.frameChannel:
-			if err := p.send(frame, &writeBuffer); err != nil {
-				return err
+			if streamPusher, _ := p.streamPushers.Load(frame.streamId); streamPusher != nil {
+				if err := streamPusher.send(frame.Frame); err != nil {
+					p.Logger().ErrorWith("发送RTP数据失败", err)
+					p.RemoveStream(frame.streamId)
+				}
+			} else {
+				frame.Release()
 			}
 		case <-interrupter:
 			return nil
 		}
+	}
+}
+
+func (p *RtpPusher) StreamPushers() []*RtpStreamPusher {
+	return p.streamPushers.Values()
+}
+
+func (p *RtpPusher) AddStream(transport string, remoteIp net.IP, remotePort int, ssrc int64, streamInfo *media.RtpStreamInfo) (streamPusher *RtpStreamPusher, err error) {
+	return lock.RLockGetDouble(p.runner, func() (streamPusher *RtpStreamPusher, err error) {
+		if !p.runner.Running() {
+			return nil, p.Logger().ErrorWith("实时音视频RTP推流通道添加失败", lifecycle.NewStateNotRunningError(p.DisplayName()))
+		}
+		streamId := p.streamPusherId.Add(1)
+		streamPusher, err = newRtpStreamPusher(streamId, p, nil, transport, remoteIp, remotePort, ssrc, streamInfo)
+		if err != nil {
+			return nil, err
+		}
+		lock.LockDo(&p.streamPusherLock, func() {
+			p.streamPushers.Store(streamId, streamPusher)
+			p.streamPusherCount.Add(1)
+		})
+		return streamPusher, nil
+	})
+}
+
+func (p *RtpPusher) RemoveStream(streamId uint64) error {
+	streamPusher, closePusher := lock.LockGetDouble(&p.streamPusherLock, func() (*RtpStreamPusher, bool) {
+		streamPlayer, _ := p.streamPushers.LoadAndDelete(streamId)
+		if streamPlayer != nil {
+			return streamPlayer, p.streamPusherCount.Add(-1) == 0
+		}
+		return nil, false
+	})
+	if streamPusher != nil {
+		streamPusher.close()
+	}
+	if closePusher {
+		p.Close(nil)
+	}
+	return nil
+}
+
+func (p *RtpPusher) canPush() bool {
+	return p.canPushFlag.Load() && !p.closeFlag.Load()
+}
+
+func (p *RtpPusher) push(frame rtpFrame.Frame, streamId uint64) {
+	defer func() {
+		if e := recover(); e != nil {
+			frame.Release()
+		}
+	}()
+	if !p.canPush() {
+		frame.Release()
+		return
+	}
+	if !utils.ChanTryPush(p.frameChannel, rtpFramePusherWrapper{Frame: frame, streamId: streamId}) {
+		frame.Release()
 	}
 }
 
 func (p *RtpPusher) StartPush() {
 	if !utils.ChanTryPush(p.pushSignal, struct{}{}) {
 		p.Logger().Warn("开始推流信号繁忙")
+	} else {
+		p.canPushFlag.Store(true)
 	}
 }
 
-func (p *RtpPusher) Started() bool {
-	return p.started.Load()
+func (p *RtpPusher) Pause() {
+	if !utils.ChanTryPush(p.pauseSignal, struct{}{}) {
+		p.Logger().Warn("暂停信号繁忙")
+	} else {
+		p.canPushFlag.Store(false)
+	}
 }
 
-func (p *RtpPusher) Push(frame rtpFrame.Frame) {
-	defer func() {
-		if e := recover(); e != nil {
-			frame.Release()
-		}
-	}()
-	if !utils.ChanTryPush(p.frameChannel, frame) {
-		frame.Release()
+func (p *RtpPusher) Info() map[string]any {
+	infos := make([]map[string]any, 0)
+	p.streamPushers.Range(func(id uint64, streamPusher *RtpStreamPusher) bool {
+		infos = append(infos, streamPusher.Info())
+		return true
+	})
+	return map[string]any{
+		"id":            p.id,
+		"maxCached":     p.maxCached,
+		"streamPushers": infos,
 	}
 }

@@ -18,9 +18,8 @@ type AnnexBInPrefixNALUParser struct {
 	cacheSize     int
 	skip          bool
 
-	naluHeader   NALUHeader
-	naluBody     [][]byte
-	naluBodySize int
+	naluHeader NALUHeader
+	naluBody   NALUBody
 
 	needParser parser.NeedParser
 }
@@ -45,7 +44,7 @@ func (p *AnnexBInPrefixNALUParser) parsePrefix(prefix []byte) (naluOffset int) {
 }
 
 func (p *AnnexBInPrefixNALUParser) complete() {
-	p.naluHeader, p.naluBody, p.naluBodySize = p.curNaluHeader, append([][]byte(nil), p.cache...), p.cacheSize
+	p.naluHeader, p.naluBody = p.curNaluHeader, NALUBody{chunks: append([][]byte(nil), p.cache...), size: p.cacheSize}
 	p.curNaluHeader, p.cache, p.cacheSize = 0, p.cache[:0], 0
 }
 
@@ -108,8 +107,8 @@ func (p *AnnexBInPrefixNALUParser) Parse(data []byte, isPrefix bool) (ok bool, e
 	return false, nil
 }
 
-func (p *AnnexBInPrefixNALUParser) NALU() (header NALUHeader, body [][]byte, bodySize int) {
-	return p.naluHeader, p.naluBody, p.naluBodySize
+func (p *AnnexBInPrefixNALUParser) NALU() (header NALUHeader, boyd NALUBody) {
+	return p.naluHeader, p.naluBody
 }
 
 func (p *AnnexBInPrefixNALUParser) Complete() bool {
@@ -124,7 +123,6 @@ func (p *AnnexBInPrefixNALUParser) Complete() bool {
 func (p *AnnexBInPrefixNALUParser) Reset() {
 	p.Complete()
 	p.naluHeader = 0
-	p.naluBody = nil
-	p.naluBodySize = 0
+	p.naluBody = NALUBody{}
 	p.needParser.Reset()
 }

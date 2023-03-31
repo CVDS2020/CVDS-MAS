@@ -4,7 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"gitee.com/sy_183/common/slice"
+	ioUtils "gitee.com/sy_183/common/utils/io"
+	"gitee.com/sy_183/cvds-mas/media/h264"
 	"io"
 	"os"
 	"strings"
@@ -12,7 +13,7 @@ import (
 )
 
 func TestParser(t *testing.T) {
-	file, err := os.Open("C:\\Users\\suy\\Documents\\Language\\Go\\cvds-cmu\\data\\44010200491320000123_44010200491320000123\\C2074-车厢1-转向架-20230314200939-2.mpg")
+	file, err := os.Open("C:\\Users\\suy\\Documents\\Language\\Go\\cvds-cmu\\data\\test\\test-20230329144733-1.mpg")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +21,9 @@ func TestParser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer logFile.Close()
 	logWriter := bufio.NewWriter(logFile)
+	defer logWriter.Flush()
 
 	parser := Parser{}
 	parser.SetPSH(new(PSH))
@@ -112,18 +115,23 @@ func TestParser(t *testing.T) {
 					parser.SetPSM(new(PSM))
 				case *PES:
 					var naluType uint8
-					if pack.PacketDataLength() >= 5 {
-						chunks := slice.Chunks[byte](pack.PackageData())
-						prefix := chunks.Slice(0, 5)
-						if bytes.Equal(prefix[:3], []byte{0, 0, 1}) {
-							naluType = prefix[3] & 0b00011111
-						} else if bytes.Equal(prefix[:4], []byte{0, 0, 0, 1}) {
-							naluType = prefix[4] & 0b00011111
+					if pack.PackageData().Size() >= 5 {
+						prefixWriter := ioUtils.Writer{Buf: make([]byte, 5)}
+						pack.PackageData().Range(func(chunk []byte) bool {
+							if prefixWriter.WriteBytes(chunk) == 0 {
+								return false
+							}
+							return true
+						})
+						if prefix := prefixWriter.Bytes(); bytes.HasPrefix(prefix, []byte{0, 0, 1}) {
+							naluType = h264.NALUHeader(prefix[3]).Type()
+						} else if bytes.HasPrefix(prefix, []byte{0, 0, 0, 1}) {
+							naluType = h264.NALUHeader(prefix[4]).Type()
 						}
 					}
 					fields := []string{
 						fmt.Sprintf("StreamId: %02x", pack.StreamId()),
-						fmt.Sprintf("DataLength: %d", pack.PacketDataLength()),
+						fmt.Sprintf("DataLength: %d", pack.PackageData().Size()),
 					}
 					if pack.PTS_DTS_Flags() == 0b10 {
 						fields = append(fields, fmt.Sprintf("PTS: %d", pack.PTS()))

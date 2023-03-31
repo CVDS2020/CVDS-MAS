@@ -5,7 +5,7 @@ import "io"
 type Pack interface {
 	StartCode() [4]byte
 
-	Size() uint
+	Size() int
 
 	io.WriterTo
 

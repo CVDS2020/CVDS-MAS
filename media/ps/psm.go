@@ -92,11 +92,11 @@ func (p *PSM) CRC32() uint32 {
 	return p.crc32
 }
 
-func (p *PSM) Size() uint {
+func (p *PSM) Size() int {
 	if p.startCode[3] == 0 {
 		return 0
 	}
-	return uint(6 + p.packetLength)
+	return int(6 + p.packetLength)
 }
 
 func (p *PSM) WriteTo(w io.Writer) (n int64, err error) {
@@ -118,7 +118,7 @@ func (p *PSM) WriteTo(w io.Writer) (n int64, err error) {
 		WriteUint16(p.programStreamInfoLength), w, &n)
 	WritePanic(w, p.descriptors[:p.programStreamInfoLength], &n)
 	WriteAndResetPanic(writer.WriteUint16(p.elementaryStreamMapLength), w, &n)
-	for i := uint16(0); i < p.elementaryStreamMapLength; i++ {
+	for i := 0; i < len(p.elementaryStreamInfos); i++ {
 		WriteToPanic(&p.elementaryStreamInfos[i], w, &n)
 	}
 	WriteAndResetPanic(writer.WriteUint32(p.crc32), w, &n)

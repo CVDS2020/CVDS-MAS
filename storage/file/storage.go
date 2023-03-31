@@ -34,7 +34,7 @@ func NewStorage() *Storage {
 		s.channelOptions = append(s.channelOptions, WithCheckDeleteInterval(cfg.CheckDeleteInterval))
 	}
 
-	mos := []meta.Option{meta.WithDBManager(dbPkg.NewDBManager(nil, cfg.Meta.DB.Mysql.DSN()))}
+	mos := []meta.Option{meta.WithDBManager(dbPkg.NewDBManager(nil, cfg.Meta.DB.Mysql.DSN(), dbPkg.WithTablesInfo(meta.MetaTablesInfos)))}
 	if cfg.Meta.EarliestIndexesCacheSize != 0 {
 		mos = append(mos, meta.WithEarliestIndexesCacheSize(cfg.Meta.EarliestIndexesCacheSize))
 	}

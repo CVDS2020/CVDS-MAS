@@ -1,16 +1,16 @@
 package channel
 
 import (
-	"errors"
-	"gitee.com/sy_183/common/def"
+	"fmt"
+	"gitee.com/sy_183/common/container"
+	"gitee.com/sy_183/common/errors"
 	"gitee.com/sy_183/common/lifecycle"
 	"gitee.com/sy_183/common/lock"
 	"gitee.com/sy_183/common/log"
 	"gitee.com/sy_183/cvds-mas/media"
-	mediaRtp "gitee.com/sy_183/cvds-mas/media/rtp"
+	"gitee.com/sy_183/cvds-mas/media/rtp"
 	rtpFrame "gitee.com/sy_183/rtp/frame"
 	rtpServer "gitee.com/sy_183/rtp/server"
-	"io"
 	"net"
 	"strings"
 	"sync"
@@ -18,81 +18,261 @@ import (
 	"time"
 )
 
-type FrameGroup struct {
-	frames []rtpFrame.FrameWriter
-	start  time.Time
-	end    time.Time
-	size   int
+type SetupConfig struct {
+	Timeout             time.Duration `json:"timeout"`
+	RtpSecMaxErr        int           `json:"rtpSecMaxErr"`
+	RtpMaxSerializedErr int           `json:"rtpMaxSerializedErr"`
 }
 
-func NewFrameGroup() *FrameGroup {
-	return new(FrameGroup)
+type rtpKeepChooser struct {
+	player      *RtpStreamPlayer
+	keepChooser rtpServer.KeepChooser
 }
 
-func timeRangeExpandRange(start, end *time.Time, curStart, curEnd time.Time, timeNodeLen int) {
-	if start.After(*end) {
-		Logger().Fatal("开始时间在结束时间之后", log.Time("开始时间", *start), log.Time("结束时间", *end))
+func (c rtpKeepChooser) OnSuccess() {
+	c.keepChooser.OnSuccess()
+}
+
+func (c rtpKeepChooser) OnError(err error) (keep bool) {
+	if !c.keepChooser.OnError(err) {
+		c.player.Logger().Error("RTP解析错误超过阈值，关闭RTP流")
+		return false
 	}
-	if curStart.After(curEnd) {
-		Logger().Fatal("开始时间在结束时间之后", log.Time("开始时间", curStart), log.Time("结束时间", curEnd))
+	return true
+}
+
+func (c rtpKeepChooser) Reset() {
+	c.keepChooser.Reset()
+}
+
+type RtpStreamPlayer struct {
+	id      uint64
+	player  *RtpPlayer
+	removed bool
+
+	transport  string
+	rtpManager *rtpServer.Manager
+	rtpServer  rtpServer.Server
+	rtpStream  atomic.Pointer[rtpServer.Stream]
+
+	localIp   net.IP
+	localPort int
+	mu        sync.Mutex
+
+	streamInfo atomic.Pointer[media.RtpStreamInfo]
+
+	rtpSecMaxErr        atomic.Int64
+	rtpMaxSerializedErr atomic.Int64
+
+	droppedFrames     atomic.Uint64
+	errorRtpPackets   atomic.Uint64
+	droppedRtpPackets atomic.Uint64
+
+	log.LoggerProvider
+}
+
+func newRtpStreamPlayer(id uint64, player *RtpPlayer, transport string) (*RtpStreamPlayer, error) {
+	p := &RtpStreamPlayer{
+		id:             id,
+		player:         player,
+		LoggerProvider: &player.AtomicLogger,
 	}
-	if start.IsZero() {
-		*start = curStart
-		*end = curEnd
-	} else {
-		du := curStart.Sub(*end)
-		if du < 0 {
-			guess := time.Duration(0)
-			if timeNodeLen > 2 {
-				guess = (end.Sub(*start)) / time.Duration(timeNodeLen-2)
-			} else if timeNodeLen == 2 {
-				guess = curEnd.Sub(curStart)
+
+	switch strings.ToLower(transport) {
+	case "udp":
+		p.transport = "udp"
+		rtpManager := rtp.GetManager()
+		server := rtpManager.Alloc()
+		if server == nil {
+			p.Logger().Error(AllocRTPServerFailed.Error())
+			return nil, AllocRTPServerFailed
+		}
+		p.rtpManager = rtpManager
+		p.rtpServer = server
+		addr := p.rtpServer.Addr().(*net.UDPAddr)
+		if ipv4 := addr.IP.To4(); ipv4 != nil {
+			p.localIp = ipv4
+		} else {
+			p.localIp = addr.IP
+		}
+		p.localPort = addr.Port
+	case "tcp":
+		p.transport = "tcp"
+		p.rtpServer = rtp.GetTCPServer()
+		addr := p.rtpServer.Addr().(*net.TCPAddr)
+		if ipv4 := addr.IP.To4(); ipv4 != nil {
+			p.localIp = ipv4
+		} else {
+			p.localIp = addr.IP
+		}
+		p.localPort = addr.Port
+	default:
+		return nil, errors.NewInvalidArgument("transport", fmt.Errorf("无效的传输协议(%s)", transport))
+	}
+
+	return p, nil
+}
+
+func (p *RtpStreamPlayer) getRtpStream() rtpServer.Stream {
+	if stream := p.rtpStream.Load(); stream != nil {
+		return *stream
+	}
+	return nil
+}
+
+func (p *RtpStreamPlayer) handleRtpFrame(stream rtpServer.Stream, frame *rtpFrame.IncomingFrame) {
+	if !p.player.FrameHandler().Push(frame, p.streamInfo.Load()) {
+		p.droppedFrames.Add(1)
+	}
+}
+
+func (p *RtpStreamPlayer) onParseRTPError(stream rtpServer.Stream, err error) (keep bool) {
+	p.errorRtpPackets.Add(1)
+	return true
+}
+
+func (p *RtpStreamPlayer) onRtpStreamClosed(rtpStream rtpServer.Stream) {
+	rtpStream.Logger().Info("RTP流已经关闭")
+	p.player.removeStream(p.id, false)
+}
+
+func (p *RtpStreamPlayer) onRtpStreamTimeout(rtpStream rtpServer.Stream) {
+	rtpStream.Logger().Warn("RTP流超时, 关闭拉流")
+}
+
+func (p *RtpStreamPlayer) onRtpLossPacket(stream rtpServer.Stream, loss int) {
+	p.droppedRtpPackets.Add(uint64(loss))
+}
+
+func (p *RtpStreamPlayer) modifyStreamInfo(streamInfo *media.RtpStreamInfo) (old *media.RtpStreamInfo, modified bool) {
+	old = p.streamInfo.Load()
+	if !streamInfo.Equal(old) {
+		p.streamInfo.Store(streamInfo)
+		return old, true
+	}
+	return old, false
+}
+
+func (p *RtpStreamPlayer) LocalIp() net.IP {
+	return p.localIp
+}
+
+func (p *RtpStreamPlayer) LocalPort() int {
+	return p.localPort
+}
+
+func (p *RtpStreamPlayer) Setup(remoteIp net.IP, remotePort int, ssrc int64, streamInfo *media.RtpStreamInfo, config SetupConfig) error {
+	if ipv4 := remoteIp.To4(); ipv4 != nil {
+		remoteIp = ipv4
+	}
+
+	var remoteAddr net.Addr
+	remoteTCPAddr := &net.TCPAddr{IP: remoteIp, Port: remotePort}
+	switch p.transport {
+	case "tcp":
+		remoteAddr = remoteTCPAddr
+	case "udp":
+		remoteAddr = (*net.UDPAddr)(remoteTCPAddr)
+	default:
+		panic(fmt.Errorf("内部错误: 未知的传输协议(%s)", p.transport))
+	}
+
+	return lock.LockGet(&p.mu, func() error {
+		if p.removed {
+			return p.Logger().ErrorWith("设置RTP拉流参数失败", errors.New("RTP流已被移除"))
+		}
+		if rtpStream := p.getRtpStream(); rtpStream != nil {
+			return p.Logger().ErrorWith("设置RTP拉流参数失败", errors.New("RTP流已经存在"))
+		}
+		recovery := func() func() {
+			oldStreamInfo, modified := p.modifyStreamInfo(streamInfo)
+			oldRtpSecMaxErr, oldRtpMaxSerializedErr := p.rtpSecMaxErr.Load(), p.rtpMaxSerializedErr.Load()
+			p.rtpSecMaxErr.Store(int64(config.RtpSecMaxErr))
+			p.rtpMaxSerializedErr.Store(int64(config.RtpMaxSerializedErr))
+			return func() {
+				p.rtpMaxSerializedErr.Store(oldRtpMaxSerializedErr)
+				p.rtpSecMaxErr.Store(oldRtpSecMaxErr)
+				if modified {
+					p.streamInfo.Store(oldStreamInfo)
+				}
 			}
-			offset := du - guess
-			*start = start.Add(offset)
+		}()
+
+		rtpStream, _ := p.rtpServer.Stream(remoteAddr, ssrc, rtpServer.KeepChooserHandler(rtpFrame.NewFrameRTPHandler(rtpFrame.FrameHandlerFunc{
+			HandleFrameFn:     p.handleRtpFrame,
+			OnParseRTPErrorFn: p.onParseRTPError,
+			OnStreamClosedFn:  p.onRtpStreamClosed,
+		}), rtpKeepChooser{player: p, keepChooser: rtpServer.NewDefaultKeepChooser(config.RtpSecMaxErr, config.RtpMaxSerializedErr, nil)}),
+			rtpServer.WithTimeout(config.Timeout),
+			rtpServer.WithOnStreamTimeout(p.onRtpStreamTimeout),
+			rtpServer.WithOnLossPacket(p.onRtpLossPacket),
+		)
+		if rtpStream == nil {
+			recovery()
+			return p.Logger().ErrorWith("设置RTP拉流参数失败", errors.New("RTP服务申请流失败"))
 		}
-		*end = curEnd
+		p.rtpStream.Store(&rtpStream)
+
+		fields := []log.Field{log.String("对端IP地址", remoteIp.String()), log.Int("对端端口", remotePort)}
+		if remoteAddr != nil {
+			fields = append(fields, log.String("对端IP地址", remoteIp.String()), log.Int("对端端口", remotePort))
+		}
+		if ssrc >= 0 {
+			fields = append(fields, log.Int64("SSRC", ssrc))
+		}
+		if streamInfo != nil {
+			fields = append(fields, log.Object("流信息", streamInfo))
+		}
+		p.Logger().Info("设置RTP拉流参数成功", fields...)
+		return nil
+	})
+}
+
+func (p *RtpStreamPlayer) StreamInfo() *media.RtpStreamInfo {
+	return p.streamInfo.Load()
+}
+
+func (p *RtpStreamPlayer) Info() map[string]any {
+	m := map[string]any{
+		"id":        p.id,
+		"transport": p.transport,
 	}
-}
-
-func (g *FrameGroup) Append(frameWriter rtpFrame.FrameWriter) {
-	frame := frameWriter.Frame()
-	g.frames = append(g.frames, frameWriter)
-	g.size += frameWriter.Size()
-	timeRangeExpandRange(&g.start, &g.end, frame.(*rtpFrame.IncomingFrame).Start(), frame.(*rtpFrame.IncomingFrame).End(), len(g.frames))
-}
-
-func (g *FrameGroup) Start() time.Time {
-	return g.start
-}
-
-func (g *FrameGroup) End() time.Time {
-	return g.end
-}
-
-func (g *FrameGroup) Size() int {
-	return g.size
-}
-
-func (g *FrameGroup) WriteTo(w io.Writer) (n int64, err error) {
-	for _, frameWriter := range g.frames {
-		nn, err := frameWriter.WriteTo(w)
-		n += nn
-		if err != nil {
-			return n, err
+	if p.localIp != nil {
+		m["localIp"] = p.localIp
+		m["localPort"] = p.localPort
+	}
+	if rtpStream := p.getRtpStream(); rtpStream != nil {
+		if remoteAddr := rtpStream.RemoteAddr(); remoteAddr != nil {
+			switch addr := remoteAddr.(type) {
+			case *net.UDPAddr:
+				m["remoteIp"] = addr.IP
+				m["remotePort"] = addr.Port
+			case *net.TCPAddr:
+				m["remoteIp"] = addr.IP
+				m["remotePort"] = addr.Port
+			}
 		}
 	}
-	return n, nil
+	if streamInfo := p.streamInfo.Load(); streamInfo != nil {
+		m["streamInfo"] = map[string]any{
+			"mediaType":   streamInfo.MediaType().EncodingName,
+			"payloadType": streamInfo.PayloadType(),
+			"clockRate":   streamInfo.ClockRate(),
+		}
+	}
+	return m
 }
 
-func (g *FrameGroup) Clear() {
-	for _, frameWriter := range g.frames {
-		frameWriter.Frame().Release()
-	}
-	g.frames = g.frames[:0]
-	g.start = time.Time{}
-	g.end = time.Time{}
-	g.size = 0
+func (p *RtpStreamPlayer) close(closeStream bool) {
+	lock.LockDo(&p.mu, func() {
+		p.removed = true
+		if rtpStream := p.getRtpStream(); rtpStream != nil && closeStream {
+			rtpStream.Close()
+		}
+		if p.rtpManager != nil {
+			p.rtpManager.Free(p.rtpServer)
+		}
+	})
 }
 
 type RtpPlayerCloseCallback func(player *RtpPlayer, channel *Channel)
@@ -100,301 +280,142 @@ type RtpPlayerCloseCallback func(player *RtpPlayer, channel *Channel)
 type RtpPlayer struct {
 	lifecycle.Lifecycle
 	runner *lifecycle.DefaultLifecycle
+	once   atomic.Bool
 
-	channel   *Channel
-	transport string
-	timeout   time.Duration
+	channel      *Channel
+	frameHandler *FrameHandler
 
-	rtpManager *rtpServer.Manager
-	rtpServer  rtpServer.Server
-	stream     atomic.Pointer[rtpServer.Stream]
-
-	localIP    net.IP
-	localPort  int
-	remoteAddr atomic.Pointer[net.TCPAddr]
-	ssrc       atomic.Int64
-	mediaMap   atomic.Pointer[[]*media.MediaType]
-	mu         sync.Mutex
-
-	storageBufferSize uint
-	frameGroup        *FrameGroup
+	streamPlayerId    atomic.Uint64
+	streamPlayerCount atomic.Int64
+	streamPlayers     container.SyncMap[uint64, *RtpStreamPlayer]
+	streamPlayerLock  sync.Mutex
 
 	log.AtomicLogger
 }
 
-func NewRTPPlayer(channel *Channel, transport string, timeout time.Duration) (*RtpPlayer, error) {
-	timeout = def.SetDefault(timeout, time.Second*5)
-	if timeout < time.Second {
-		timeout = time.Second
-	}
+func newRtpPlayer(channel *Channel) *RtpPlayer {
 	p := &RtpPlayer{
-		channel:           channel,
-		timeout:           timeout,
-		storageBufferSize: channel.StorageBufferSize(),
-		frameGroup:        NewFrameGroup(),
+		channel: channel,
 	}
-	p.ssrc.Store(-1)
-
-	switch strings.ToLower(transport) {
-	case "udp":
-		p.transport = "udp"
-		rtpManager := mediaRtp.GetManager()
-		server := rtpManager.Alloc()
-		if server == nil {
-			channel.Logger().Error(AllocRTPServerFailed.Error())
-			return nil, AllocRTPServerFailed
-		}
-		p.rtpManager = rtpManager
-		p.rtpServer = server
-		addr := p.rtpServer.Addr().(*net.UDPAddr)
-		if ipv4 := addr.IP.To4(); ipv4 != nil {
-			p.localIP = ipv4
-		} else {
-			p.localIP = addr.IP
-		}
-		p.localPort = addr.Port
-	default:
-		p.transport = "tcp"
-		p.rtpServer = mediaRtp.GetTCPServer()
-		addr := p.rtpServer.Addr().(*net.TCPAddr)
-		if ipv4 := addr.IP.To4(); ipv4 != nil {
-			p.localIP = ipv4
-		} else {
-			p.localIP = addr.IP
-		}
-		p.localPort = addr.Port
-	}
-
+	p.frameHandler = NewFrameHandler(p)
 	p.SetLogger(channel.Logger().Named(p.DisplayName()))
-	p.runner = lifecycle.NewWithInterruptedRun(nil, p.run)
+	p.runner = lifecycle.NewWithInterruptedRun(p.start, p.run)
 	p.Lifecycle = p.runner
-	return p, nil
+	return p
 }
 
 func (p *RtpPlayer) DisplayName() string {
 	return p.channel.RtpPlayerDisplayName()
 }
 
-func (p *RtpPlayer) Transport() string {
-	return p.transport
+func (p *RtpPlayer) Channel() *Channel {
+	return p.channel
 }
 
-func (p *RtpPlayer) Timeout() time.Duration {
-	return p.timeout
+func (p *RtpPlayer) FrameHandler() *FrameHandler {
+	return p.frameHandler
 }
 
-func (p *RtpPlayer) LocalIP() net.IP {
-	return p.localIP
-}
-
-func (p *RtpPlayer) LocalPort() int {
-	return p.localPort
-}
-
-func (p *RtpPlayer) RemoteIPPort() (net.IP, int) {
-	remoteTCPAddr := p.remoteAddr.Load()
-	if remoteTCPAddr == nil {
-		return nil, 0
+func (p *RtpPlayer) start(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	if !p.once.CompareAndSwap(false, true) {
+		return lifecycle.NewStateClosedError(p.channel.RtpPlayerDisplayName())
 	}
-	return remoteTCPAddr.IP, remoteTCPAddr.Port
-}
-
-func (p *RtpPlayer) SSRC() int64 {
-	return p.ssrc.Load()
-}
-
-func (p *RtpPlayer) Info() map[string]any {
-	info := map[string]any{
-		"transport": p.Transport(),
-		"timeout":   p.Timeout(),
-		"localIp":   p.LocalIP(),
-		"localPort": p.LocalPort(),
-	}
-	if ip, port := p.RemoteIPPort(); ip != nil {
-		info["remoteIp"] = ip
-		info["remotePort"] = port
-	}
-	if ssrc := p.SSRC(); ssrc >= 0 {
-		info["ssrc"] = ssrc
-	}
-	if mediaMap := p.MediaMap(); mediaMap != nil {
-		rtpMap := make(map[uint8]string)
-		for id, mediaType := range mediaMap {
-			if mediaType != nil {
-				rtpMap[uint8(id)] = mediaType.Name
-			}
-		}
-		info["rtpMap"] = rtpMap
-	}
-	return info
-}
-
-func (p *RtpPlayer) getStream() rtpServer.Stream {
-	if stream := p.stream.Load(); stream != nil {
-		return *stream
-	}
+	p.frameHandler.Start()
 	return nil
 }
 
 func (p *RtpPlayer) run(_ lifecycle.Lifecycle, interrupter chan struct{}) error {
+	var frameHandlerClosed bool
 	defer func() {
-		if stream := p.getStream(); stream != nil {
-			stream.Close()
+		if !frameHandlerClosed {
+			p.frameHandler.Shutdown()
 		}
-		if p.rtpManager != nil {
-			p.rtpManager.Free(p.rtpServer)
+		if rtpPushers := p.channel.RtpPushers(); len(rtpPushers) > 0 {
+			closedWaiters := make([]<-chan error, 0, len(rtpPushers))
+			for _, pusher := range rtpPushers {
+				pusher.Close(nil)
+				closedWaiters = append(closedWaiters, pusher.ClosedWaiter())
+			}
+			for _, waiter := range closedWaiters {
+				<-waiter
+			}
+		}
+		if streamPlayers := p.streamPlayers.Values(); len(streamPlayers) > 0 {
+			for _, streamPlayer := range streamPlayers {
+				p.removeStream(streamPlayer.id, true)
+			}
 		}
 	}()
-	<-interrupter
+	frameHandlerClosedWaiter := p.frameHandler.ClosedWaiter()
+	select {
+	case <-frameHandlerClosedWaiter:
+		frameHandlerClosed = true
+	case <-interrupter:
+	}
 	return nil
 }
 
-func (p *RtpPlayer) storageFrameRaw(frame rtpFrame.Frame, mediaType *media.MediaType) {
-	fw := rtpFrame.NewPayloadFrameWriter(frame)
-	size := fw.Size()
-	if uint(size) > p.storageBufferSize {
-		frame.Release()
-		return
-	}
-	if frameGroup := p.frameGroup; uint(frameGroup.Size()+fw.Size()) > p.storageBufferSize {
-		if storageChannel := p.channel.loadEnabledStorageChannel(); storageChannel != nil {
-			storageChannel.Write(frameGroup, uint(frameGroup.size), frameGroup.Start(), frameGroup.End(), mediaType.ID, true)
-		}
-		p.frameGroup.Clear()
-	}
-	p.frameGroup.Append(fw)
+func (p *RtpPlayer) StreamPlayers() []*RtpStreamPlayer {
+	return p.streamPlayers.Values()
 }
 
-func (p *RtpPlayer) storageFrameRtp(frame rtpFrame.Frame, mediaType *media.MediaType) {
-	fw := rtpFrame.NewFullFrameWriter(frame)
-	size := fw.Size()
-	if uint(size) > p.storageBufferSize {
-		frame.Release()
-		return
-	}
-	if frameGroup := p.frameGroup; uint(frameGroup.Size()+fw.Size()) > p.storageBufferSize {
-		if storageChannel := p.channel.loadEnabledStorageChannel(); storageChannel != nil {
-			storageChannel.Write(frameGroup, uint(frameGroup.size), frameGroup.Start(), frameGroup.End(), mediaType.ID, true)
+func (p *RtpPlayer) AddStream(transport string) (streamPlayer *RtpStreamPlayer, err error) {
+	return lock.RLockGetDouble(p.runner, func() (streamPlayer *RtpStreamPlayer, err error) {
+		if !p.runner.Running() {
+			return nil, p.Logger().ErrorWith("RTP拉流通道添加失败", lifecycle.NewStateNotRunningError(p.DisplayName()))
 		}
-		p.frameGroup.Clear()
-	}
-	p.frameGroup.Append(fw)
-}
-
-func (p *RtpPlayer) handleFrame(stream rtpServer.Stream, frame *rtpFrame.IncomingFrame) {
-	var mediaType *media.MediaType
-	if mediaMap := p.MediaMap(); mediaMap != nil {
-		mediaType = mediaMap[frame.PayloadType()]
-	}
-	if mediaType == nil {
-		mediaType = media.GetMediaType(uint32(frame.PayloadType()))
-	}
-	defer frame.Release()
-	if mediaType != nil && mediaType.ID < 128 {
-		if uint8(mediaType.ID) != frame.PayloadType() {
-			frame.SetPayloadType(uint8(mediaType.ID))
+		streamId := p.streamPlayerId.Add(1)
+		streamPlayer, err = newRtpStreamPlayer(streamId, p, transport)
+		if err != nil {
+			return nil, err
 		}
-		pushers := p.channel.RtpPushers()
-		for _, pusher := range pushers {
-			if pusher.Started() {
-				pusher.Push(rtpFrame.UseFrame(frame))
-			}
-		}
-		switch p.channel.StorageType() {
-		case "rtp":
-			p.storageFrameRtp(frame.Use(), mediaType)
-		case "raw":
-			p.storageFrameRaw(frame.Use(), mediaType)
-		default:
-			p.storageFrameRtp(frame.Use(), mediaType)
-		}
-	}
-}
-
-func (p *RtpPlayer) onStreamClosed(stream rtpServer.Stream) {
-	stream.Logger().Info("RTP流已经关闭")
-	lock.LockDo(&p.mu, func() {
-		p.stream.Store(nil)
-		if storageChannel := p.channel.loadEnabledStorageChannel(); storageChannel != nil {
-			storageChannel.Sync()
-		}
-		p.Close(nil)
+		lock.LockDo(&p.streamPlayerLock, func() {
+			p.streamPlayers.Store(streamId, streamPlayer)
+			p.streamPlayerCount.Add(1)
+		})
+		return streamPlayer, nil
 	})
 }
 
-func (p *RtpPlayer) MediaMap() []*media.MediaType {
-	if mediaMap := p.mediaMap.Load(); mediaMap != nil {
-		return *mediaMap
-	}
-	return nil
-}
-
-func (p *RtpPlayer) Setup(rtpMap map[uint8]string, remoteIP net.IP, remotePort int, ssrc int64, once bool) error {
+func (p *RtpPlayer) SetupStream(streamId uint64, remoteIP net.IP, remotePort int, ssrc int64, streamInfo *media.RtpStreamInfo, config SetupConfig) error {
 	return lock.RLockGet(p.runner, func() error {
 		if !p.runner.Running() {
-			return p.Logger().ErrorWith("设置RTP拉流参数失败", lifecycle.NewStateNotRunningError(p.DisplayName()))
+			return p.Logger().ErrorWith("RTP拉流通道设置失败", lifecycle.NewStateNotRunningError(p.DisplayName()))
 		}
-
-		mediaMap := make([]*media.MediaType, 128)
-		for id, name := range rtpMap {
-			if id < 128 {
-				mediaMap[id] = media.ParseMediaType(name)
-			}
+		streamPlayer, ok := p.streamPlayers.Load(streamId)
+		if !ok {
+			return fmt.Errorf("RTP流(%d)未找到", streamId)
 		}
-
-		if ipv4 := remoteIP.To4(); ipv4 != nil {
-			remoteIP = ipv4
-		}
-		var remoteAddr net.Addr
-		remoteTCPAddr := &net.TCPAddr{IP: remoteIP, Port: remotePort}
-		switch p.transport {
-		case "tcp":
-			remoteAddr = remoteTCPAddr
-		case "udp":
-			remoteAddr = (*net.UDPAddr)(remoteTCPAddr)
-		}
-
-		return lock.LockGet(&p.mu, func() error {
-			//now := time.Now()
-			if stream := p.getStream(); stream != nil {
-				if once {
-					return nil
-				}
-				//p.setupTime.Store(&now)
-				stream.SetRemoteAddr(remoteAddr)
-				stream.SetSSRC(ssrc)
-			} else {
-				p.mediaMap.Store(&mediaMap)
-				stream, _ = p.rtpServer.Stream(remoteAddr, ssrc, rtpFrame.NewFrameRTPHandler(rtpFrame.FrameHandlerFunc{
-					HandleFrameFn:    p.handleFrame,
-					OnStreamClosedFn: p.onStreamClosed,
-				}), rtpServer.WithTimeout(p.timeout), rtpServer.WithOnStreamTimeout(func(rtpServer.Stream) {
-					stream.Logger().Warn("RTP流超时, 关闭拉流")
-				}))
-				if stream == nil {
-					p.mediaMap.Store(nil)
-					return p.Logger().ErrorWith("设置RTP拉流参数失败", errors.New("RTP服务申请流失败"))
-				}
-				//p.setupTime.Store(&now)
-				p.stream.Store(&stream)
-			}
-
-			p.remoteAddr.Store(remoteTCPAddr)
-			p.ssrc.Store(ssrc)
-
-			fields := []log.Field{log.String("对端IP地址", remoteIP.String()), log.Int("对端端口", remotePort)}
-			if remoteAddr != nil {
-				fields = append(fields, log.String("对端IP地址", remoteIP.String()), log.Int("对端端口", remotePort))
-			}
-			if ssrc >= 0 {
-				fields = append(fields, log.Int64("SSRC", ssrc))
-			}
-			if rtpMap != nil {
-				fields = append(fields, log.Reflect("RtpMap", rtpMap))
-			}
-			p.Logger().Info("设置RTP拉流参数成功", fields...)
-
-			return nil
-		})
+		return streamPlayer.Setup(remoteIP, remotePort, ssrc, streamInfo, config)
 	})
+}
+
+func (p *RtpPlayer) removeStream(streamId uint64, closeStream bool) {
+	streamPlayer, closePlayer := lock.LockGetDouble(&p.streamPlayerLock, func() (*RtpStreamPlayer, bool) {
+		streamPlayer, _ := p.streamPlayers.LoadAndDelete(streamId)
+		if streamPlayer != nil {
+			return streamPlayer, p.streamPlayerCount.Add(-1) == 0
+		}
+		return nil, false
+	})
+	if streamPlayer != nil {
+		streamPlayer.close(closeStream)
+	}
+	if closePlayer {
+		p.Close(nil)
+	}
+}
+
+func (p *RtpPlayer) RemoveStream(id uint64) error {
+	p.removeStream(id, true)
+	return nil
+}
+
+func (p *RtpPlayer) Info() map[string]any {
+	infos := make([]map[string]any, 0)
+	p.streamPlayers.Range(func(id uint64, streamPlayer *RtpStreamPlayer) bool {
+		infos = append(infos, streamPlayer.Info())
+		return true
+	})
+	return map[string]any{"streamPlayers": infos}
 }
